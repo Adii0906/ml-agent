@@ -1,16 +1,26 @@
 # ML Engineer: Autonomous AI Agent 🚀
 
-A complete, autonomous ML workflow automation tool.
-
-## Quick Overview
-
-ML Engineer is a futuristic AI assistant that automates the entire ML pipeline from research to deployment.
-
-**Important**: No random fallbacks - strictly uses your Groq API key for all AI features.
+An end-to-end ML workflow automation tool powered by Groq's Llama models — from research to deployment, all in one place.
 
 ---
 
-## Architecture
+## What Is This?
+
+**ML Engineer** is an AI-powered assistant that handles the full machine learning pipeline for you. Instead of stitching together multiple tools and scripts, you get a single interface that:
+
+- Searches and ranks research papers from arXiv
+- Analyzes your dataset automatically
+- Recommends the best ML algorithm for your data (with reasoning)
+- Trains models in one click with real-time progress updates
+- Generates professional reports with charts and insights
+
+Think of it as your personal ML co-pilot — you bring the data and the ideas, it handles the heavy lifting.
+
+> **Note:** All AI features require your own Groq API key. No fallbacks or mock responses are used.
+
+---
+
+## How It's Built
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -33,60 +43,104 @@ ML Engineer is a futuristic AI assistant that automates the entire ML pipeline f
 └───────────────┘             └──────────────┘
 ```
 
----
-
-## What It Does
-
-1. **Research Papers**: Search arXiv and get AI-ranked results
-2. **Data Lab**: Auto-analyze your dataset (statistics, missing values, etc.)
-3. **AI Recommendation**: Get the best algorithm for your data with reasoning
-4. **Auto-Train**: One-click training with real-time updates
-5. **Insights**: Professional ML reports with charts and recommendations
+The frontend (React) communicates with the backend (FastAPI) over HTTP and WebSockets. The backend connects to two subsystems: the LLM engine (Groq or a local Ollama instance) and the ML pipeline (scikit-learn for training and preprocessing).
 
 ---
 
-## Get Started
+## Features at a Glance
 
-### 1. Add Your API Key
+| Feature | What It Does |
+|---|---|
+| **Paper Search** | Search arXiv and get AI-ranked results relevant to your topic |
+| **Data Lab** | Upload a CSV and get instant statistics, missing value detection, and data profiling |
+| **AI Recommendation** | Receive a suggested algorithm for your dataset, with an explanation of why |
+| **Auto-Train** | Train a model with one click; watch real-time progress via WebSocket |
+| **Insights** | Download a full ML report with charts and next-step recommendations |
 
-Create a `.env` file in the **root directory**:
+---
+
+## Getting Started
+
+Follow these steps in order. It should take less than five minutes.
+
+### Step 1 — Get a Groq API Key
+
+If you don't have one yet, sign up at [console.groq.com](https://console.groq.com) and create a free API key.
+
+### Step 2 — Add Your API Key
+
+In the **root directory** of this project, create a file named `.env` and add the following line:
 
 ```env
 GROQ_API_KEY=gsk_your_actual_key_here
 ```
 
-### 2. Start the App
+Replace `gsk_your_actual_key_here` with your real key. This file is never committed to version control.
+
+### Step 3 — Start the Backend
+
+Open a terminal, navigate to the `backend` folder, and run:
 
 ```bash
-# Backend (Terminal 1)
 cd backend
 python -u main.py
+```
 
-# Frontend (Terminal 2)
+The backend will start on `http://localhost:8000`.
+
+### Step 4 — Start the Frontend
+
+Open a **second terminal**, navigate to the `frontend` folder, and run:
+
+```bash
 cd frontend
-npm install
+npm install   # only needed the first time
 npm run dev
 ```
 
-### 3. Open the App
+The frontend will start on `http://localhost:5173`.
 
-Visit: **http://localhost:5173**
+### Step 5 — Open the App
+
+Visit **[http://localhost:5173](http://localhost:5173)** in your browser. You're ready to go.
 
 ---
 
-## Quick Test
+## Try It Out
 
-Use the sample dataset at `data/sample.csv` to experience the full workflow.
+A sample dataset is included at `data/sample.csv`. Use it to walk through the full workflow end-to-end without needing your own data:
+
+1. Upload `sample.csv` in the **Data Lab** tab
+2. Review the auto-generated data profile
+3. Click **Get AI Recommendation** to see which algorithm fits best
+4. Hit **Train** and watch the model build in real time
+5. Head to **Insights** to download your report
 
 ---
 
 ## Tech Stack
 
-- **Frontend**: React + Vite + Framer Motion
-- **Backend**: FastAPI + SQLite
-- **AI**: Groq Llama 3.3-70B / Local Ollama
-- **ML**: Scikit-learn + Pandas + NumPy
+| Layer | Technology |
+|---|---|
+| Frontend | React, Vite, Framer Motion |
+| Backend | FastAPI, SQLite |
+| AI / LLM | Groq Llama 3.3-70B, Local Ollama (optional) |
+| ML | Scikit-learn, Pandas, NumPy |
 
 ---
 
-Built for ML Engineers who want to focus on ideas, not boilerplate.
+## Troubleshooting
+
+**The backend won't start.**
+Make sure Python 3.9+ is installed and your `.env` file is in the root directory (not inside `backend/`).
+
+**I'm getting API errors.**
+Double-check that your Groq API key is correct and has not exceeded its rate limit.
+
+**The frontend shows a blank screen.**
+Ensure the backend is running before opening the frontend. Check the browser console for errors.
+
+**npm install fails.**
+Make sure Node.js 18+ is installed. Run `node --version` to check.
+
+Built for ML engineers who want to focus on ideas, not boilerplate.

@@ -5,6 +5,7 @@ import './App.css';
 import Header from './components/Header';
 import Sidebar from './components/Sidebar';
 import MainContent from './components/MainContent';
+import IntroSequence from './components/IntroSequence';
 
 function App() {
   const [activeTab, setActiveTab] = useState('papers');
@@ -12,6 +13,7 @@ function App() {
   const [selectedExperiment, setSelectedExperiment] = useState(null);
   const [loading, setLoading] = useState(false);
   const [sharedData, setSharedData] = useState({});
+  const [showIntro, setShowIntro] = useState(true);
   const [showWelcome, setShowWelcome] = useState(true);
 
   useEffect(() => {
@@ -80,10 +82,17 @@ function App() {
   return (
     <div className="app">
       <AnimatePresence>
-        {showWelcome && (
+        {showIntro && (
+          <IntroSequence key="intro" onComplete={() => setShowIntro(false)} />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {!showIntro && showWelcome && (
           <motion.div
             key="welcome"
-            initial={{ opacity: 1 }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
             exit={{ opacity: 0, y: -100, scale: 0.95 }}
             transition={{ duration: 0.9, ease: [0.22, 1, 0.36, 1] }}
             style={{
@@ -100,6 +109,11 @@ function App() {
               padding: '2rem 1rem'
             }}
           >
+            <div className="intro-grid" style={{
+              position: 'absolute',
+              inset: 0,
+              pointerEvents: 'none'
+            }} />
             <div style={{
               position: 'absolute',
               inset: 0,

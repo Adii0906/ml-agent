@@ -1,48 +1,24 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# One-time local setup: Python virtualenv for the backend + npm install for the frontend.
+set -euo pipefail
+cd "$(dirname "$0")"
 
-echo "🚀 Autonomous ML Engineer - Setup Script"
-echo "=========================================="
+echo "→ Backend (Python ≥ 3.10)"
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip >/dev/null
+.venv/bin/pip install -r backend/requirements-dev.txt
 
-# Create directories
-echo "📁 Creating directories..."
-mkdir -p data
-mkdir -p backend
-mkdir -p frontend/src/components/tabs
-mkdir -p logs
+echo "→ Frontend (Node ≥ 18)"
+(cd frontend && npm install)
 
-# Setup Backend
-echo "🐍 Setting up backend..."
-cd backend
-if [ ! -f ".env" ]; then
-    echo "📝 Creating .env file..."
-    cp ../.env.example .env
-    echo "⚠️  Please update .env with your API keys"
-fi
+[ -f .env ] || cp .env.example .env
 
-if [ ! -d "venv" ]; then
-    echo "📦 Creating Python virtual environment..."
-    python3.11 -m venv venv
-    source venv/bin/activate
-    pip install -r ../requirements.txt
-fi
-cd ..
+cat <<'MSG'
 
-# Setup Frontend
-echo "🎨 Setting up frontend..."
-cd frontend
-if [ ! -d "node_modules" ]; then
-    echo "📦 Installing npm dependencies..."
-    npm install
-fi
-cd ..
+Setup complete. Start the app in two terminals:
 
-echo ""
-echo "✅ Setup complete!"
-echo ""
-echo "Next steps:"
-echo "1. Update .env with your API keys (ANTHROPIC_API_KEY, GROQ_API_KEY)"
-echo "2. Run: docker-compose up"
-echo "   OR"
-echo "3. Run backend: cd backend && source venv/bin/activate && python main.py"
-echo "4. Run frontend: cd frontend && npm run dev"
-echo ""
+  cd backend && ../.venv/bin/python main.py      # API on http://localhost:8000
+  cd frontend && npm run dev                     # UI  on http://localhost:5173
+
+Optional: add GROQ_API_KEY to .env for AI explanations (everything else works without it).
+MSG

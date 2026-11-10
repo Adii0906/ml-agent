@@ -1,461 +1,781 @@
-from fastapi import FastAPI, HTTPException, WebSocket, BackgroundTasks, UploadFile, File
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import asyncio
-import json
-from datetime import datetime
-from typing import Optional
-import os
-from dotenv import load_dotenv
-import logging
-import shutil
-from pathlib import Path
+"""ML-Agent API server.
 
-# Import our modules
-from ml_engine import MLEngine
-from models import (
-    DatasetRequest, AlgorithmRecommendation, 
-    TrainingRequest, ExperimentResult
-)
-
-# Load environment variables from root directory
-dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
-if os.path.exists(dotenv_path):
-    load_dotenv(dotenv_path)
-else:
-    load_dotenv()
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = FastAPI(title="ML-Agent", version="1.0.0")
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize ML Engine
-ml_engine = MLEngine()
-
-# UPLOAD DIRECTORY
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
-
-# Mount static files (Frontend)
-if os.path.exists("static"):
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
-
-# WebSocket connections for real-time updates
-active_connections = []
-
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections = []
-    
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-    
-    async def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-    
-    async def broadcast(self, message: dict):
-        for connection in self.active_connections:
-            try:
-                await connection.send_json(message)
-            except Exception as e:
-                logger.error(f"Error broadcasting: {e}")
-
-manager = ConnectionManager()
-
-# ============ ROUTES ============
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-@app.post("/upload-dataset")
-async def upload_dataset(file: UploadFile = File(...)):
-    """Upload a dataset file to the server"""
-    try:
-        file_path = UPLOAD_DIR / file.filename
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        return {
-            "status": "success",
-            "file_path": str(file_path.absolute()),
-            "filename": file.filename
-        }
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/search-papers")
-async def search_papers(query: str, limit: int = 5):
-    """Search for papers using Groq/arXiv"""
-    try:
-        papers = await ml_engine.search_papers(query, limit)
-        return {
-            "status": "success",
-            "papers": papers,
-            "count": len(papers)
-        }
-    except Exception as e:
-        logger.error(f"Error searching papers: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/get-dataset-preview")
-async def get_dataset_preview(file_path: str, rows: int = 20):
-    """Get dataset preview as a table for display"""
-    import pandas as pd
-    try:
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="File not found")
-        
-        encodings = ['utf-8', 'latin1', 'utf-16']
-        df = None
-        
-        for encoding in encodings:
-            try:
-                if file_path.endswith('.csv'):
-                    df = pd.read_csv(file_path, encoding=encoding, nrows=rows * 2)
-                elif file_path.endswith('.parquet'):
-                    df = pd.read_parquet(file_path)
-                    df = df.head(rows * 2)
-                break
-            except:
-                continue
-        
-        if df is None:
-            raise HTTPException(status_code=400, detail="Could not read file with any supported encoding")
-        
-        # Get first N rows and convert to JSON
-        preview = df.head(rows).to_dict(orient='records')
-        columns = list(df.columns)
-        dtypes = {col: str(df[col].dtype) for col in columns}
-        
-        return {
-            "status": "success",
-            "columns": columns,
-            "dtypes": dtypes,
-            "data": preview,
-            "total_rows": len(df)
-        }
-    except Exception as e:
-        logger.error(f"Error getting dataset preview: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/analyze-dataset")
-async def analyze_dataset(request: DatasetRequest):
-    """Analyze dataset and get basic statistics"""
-    try:
-        logger.info(f"Analyzing dataset at path: {request.file_path}")
-        if not os.path.exists(request.file_path):
-            logger.error(f"File not found: {request.file_path}")
-            raise HTTPException(status_code=404, detail=f"Dataset file not found at {request.file_path}")
-            
-        analysis = await ml_engine.analyze_dataset(
-            request.file_path,
-            request.dataset_type
-        )
-        return {
-            "status": "success",
-            "analysis": analysis
-        }
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error(f"Error analyzing dataset: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/recommend-algorithm")
-async def recommend_algorithm(request: DatasetRequest):
-    """Use Claude API to recommend best algorithm based on dataset"""
-    try:
-        analysis = await ml_engine.analyze_dataset(
-            request.file_path,
-            request.dataset_type
-        )
-        
-        # Get Claude's recommendation
-        recommendation = await ml_engine.get_algorithm_recommendation(
-            analysis=analysis,
-            dataset_type=request.dataset_type,
-            task_type=request.task_type
-        )
-        
-        return {
-            "status": "success",
-            "recommendation": recommendation
-        }
-    except Exception as e:
-        logger.error(f"Error recommending algorithm: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/train-model")
-async def train_model(request: TrainingRequest, background_tasks: BackgroundTasks):
-    """Start model training with user-approved algorithm"""
-    try:
-        experiment_id = await ml_engine.create_experiment(
-            name=request.experiment_name,
-            algorithm=request.algorithm,
-            dataset_path=request.dataset_path,
-            config=request.config
-        )
-        
-        # Start training in background
-        background_tasks.add_task(
-            train_model_task,
-            experiment_id,
-            request
-        )
-        
-        return {
-            "status": "success",
-            "experiment_id": experiment_id,
-            "message": "Training started"
-        }
-    except Exception as e:
-        logger.error(f"Error starting training: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/experiments")
-async def get_experiments():
-    """Get all experiments"""
-    try:
-        experiments = await ml_engine.get_all_experiments()
-        return {
-            "status": "success",
-            "experiments": experiments
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/experiments/{experiment_id}")
-async def get_experiment(experiment_id: str):
-    """Get specific experiment details"""
-    try:
-        experiment = await ml_engine.get_experiment(experiment_id)
-        if not experiment:
-            raise HTTPException(status_code=404, detail="Experiment not found")
-        return {
-            "status": "success",
-            "experiment": experiment
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/experiments/{experiment_id}")
-async def delete_experiment(experiment_id: str):
-    """Delete an experiment permanently"""
-    try:
-        deleted = await ml_engine.delete_experiment(experiment_id)
-        if not deleted:
-            raise HTTPException(status_code=404, detail="Experiment not found")
-        return {
-            "status": "success",
-            "message": "Experiment deleted"
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting experiment: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/experiments/{experiment_id}/report")
-async def get_report(experiment_id: str):
-    """Generate professional report for an experiment"""
-    try:
-        report = await ml_engine.generate_report(experiment_id)
-        return {
-            "status": "success",
-            "report": report
-        }
-    except Exception as e:
-        logger.error(f"Error generating report: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/experiments/{experiment_id}/export-report")
-async def export_report(experiment_id: str):
-    """Export experiment report as a downloadable text file"""
-    try:
-        experiment = await ml_engine.get_experiment(experiment_id)
-        if not experiment:
-            raise HTTPException(status_code=404, detail="Experiment not found")
-
-        report = await ml_engine.generate_report(experiment_id)
-        m = experiment['metrics']
-        feat_imp = m.get('feature_importance', {})
-        feat_lines = ""
-        for f, imp in zip(feat_imp.get('features', [])[:10], feat_imp.get('importances', [])[:10]):
-            feat_lines += f"  {f}: {imp:.4f}\n"
-
-        report_content = f"""ML-AGENT: AUTONOMOUS ML REPORT
-{'='*60}
-Experiment : {experiment['name']}
-Algorithm  : {experiment['algorithm']}
-Date       : {experiment['created_at']}
-Status     : {experiment['status']}
-Train Time : {experiment['training_time']}s
-
-{'='*60}
-DATASET SUMMARY
-{'='*60}
-Samples    : {m.get('n_samples','N/A')}
-Features   : {m.get('n_features','N/A')}
-Target     : {m.get('target_column','N/A')}
-Task Type  : {m.get('task_type','N/A')}
-Dataset Sz : {m.get('dataset_size_category','N/A')}
-Validation : {m.get('validation_strategy','N/A')}
-{('NOTE: ' + m['note']) if m.get('note') else ''}
-
-{'='*60}
-PERFORMANCE METRICS
-{'='*60}
-{json.dumps({k:v for k,v in m.items() if k not in ['feature_importance']}, indent=2)}
-
-{'='*60}
-FEATURE IMPORTANCE (Top 10)
-{'='*60}
-{feat_lines or 'Not available for this model type.'}
-
-{'='*60}
-EXECUTIVE SUMMARY
-{'='*60}
-{report.get('summary', 'N/A')}
-
-{'='*60}
-PREPROCESSING PIPELINE
-{'='*60}
-{report.get('preprocessing_summary', 'N/A')}
-
-{'='*60}
-KEY INSIGHTS
-{'='*60}
-{chr(10).join(['• ' + i for i in report.get('insights', [])])}
-
-{'='*60}
-AI RECOMMENDATION
-{'='*60}
-{report.get('recommendation', 'N/A')}
-
-{'='*60}
-NEXT STEPS
-{'='*60}
-{chr(10).join(['• ' + s for s in report.get('next_steps', [])])}
+All routes are served at both ``/`` (backwards compatible with the original
+API) and ``/api`` (used by the new frontend, which lets the production build
+serve the single-page app from ``/`` without path clashes).
 """
-        file_path = f"report_{experiment_id}.txt"
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(report_content)
+from __future__ import annotations
 
-        safe_name = "".join(c if c.isalnum() or c in ('-','_') else '_' for c in experiment['name'])
-        return StreamingResponse(
-            open(file_path, "rb"),
-            media_type="text/plain",
-            headers={"Content-Disposition": f"attachment; filename=ML-Agent_Report_{safe_name}.txt"}
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error exporting report: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+import asyncio
+import logging
+import os
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
 
-@app.get("/experiments/{experiment_id}/export-model")
-async def export_model(experiment_id: str):
-    """Export trained model as a downloadable joblib file"""
-    try:
-        experiment = await ml_engine.get_experiment(experiment_id)
-        if not experiment:
-            raise HTTPException(status_code=404, detail="Experiment not found")
-        if experiment['status'] != 'completed':
-            raise HTTPException(status_code=400, detail=f"Experiment is not completed (status: {experiment['status']})")
+import joblib
+import pandas as pd
+from fastapi import APIRouter, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
-        file_path = f"model_{experiment_id}.joblib"
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Model file not found. The model may not have been saved correctly.")
+from core import algorithms as algs
+from core import papers as paper_search
+from core import profiling, recommend, reports
+from core.config import BACKEND_DIR, ROOT_DIR, Settings
+from core.datasets import DatasetError, DatasetRegistry
+from core.jobs import ACTIVE, TERMINAL, DuplicateJob, JobManager, make_work
+from core.llm import DISCLAIMER, LLM, LLMUnavailable
+from core.store import Store
+from core.training import TrainingError, fingerprint, validate_config
+from core.util import clean_json, safe_filename, utcnow
 
-        safe_name = "".join(c if c.isalnum() or c in ('-','_') else '_' for c in experiment['name'])
-        return StreamingResponse(
-            open(file_path, "rb"),
-            media_type="application/octet-stream",
-            headers={"Content-Disposition": f"attachment; filename=ML-Agent_{safe_name}.joblib"}
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error exporting model: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("ml-agent")
 
-@app.websocket("/ws/train/{experiment_id}")
-async def websocket_train(websocket: WebSocket, experiment_id: str):
-    """WebSocket for real-time training updates"""
-    await manager.connect(websocket)
-    try:
-        while True:
-            data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_json({"type": "pong"})
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-    finally:
-        await manager.disconnect(websocket)
+SAMPLES_DIR = ROOT_DIR / "data"
 
-# ============ BACKGROUND TASKS ============
 
-async def train_model_task(experiment_id: str, request: TrainingRequest):
-    """Background task for training"""
-    try:
-        # Notify start
-        await manager.broadcast({
-            "type": "training_started",
-            "experiment_id": experiment_id,
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        # Run training with streaming updates
-        async for update in ml_engine.train_model_streaming(
-            experiment_id,
-            request.algorithm,
-            request.dataset_path,
-            request.config
-        ):
-            await manager.broadcast({
-                "type": "training_update",
-                "experiment_id": experiment_id,
-                "update": update,
-                "timestamp": datetime.now().isoformat()
-            })
-        
-        # Notify completion
-        result = await ml_engine.get_experiment(experiment_id)
-        await manager.broadcast({
-            "type": "training_completed",
-            "experiment_id": experiment_id,
-            "result": result,
-            "timestamp": datetime.now().isoformat()
-        })
-        
-    except Exception as e:
-        logger.error(f"Training error: {e}")
-        await manager.broadcast({
-            "type": "training_error",
-            "experiment_id": experiment_id,
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        })
+# ------------------------------------------------------------------ schemas
+class AlgorithmSpec(BaseModel):
+    id: str
+    hyperparameters: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExperimentCreate(BaseModel):
+    dataset_id: str
+    target: str
+    name: Optional[str] = None
+    task_type: Literal["auto", "classification", "regression"] = "auto"
+    algorithms: List[AlgorithmSpec] = Field(min_length=1, max_length=12)
+    preprocessing: Dict[str, Any] = Field(default_factory=dict)
+    split: Dict[str, Any] = Field(default_factory=dict)
+    options: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CleanRequest(BaseModel):
+    actions: List[Dict[str, Any]] = Field(min_length=1)
+
+
+class RenameRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class PredictRequest(BaseModel):
+    rows: List[Dict[str, Any]] = Field(min_length=1, max_length=1000)
+
+
+class SummarizeRequest(BaseModel):
+    title: str
+    abstract: str
+    context: Optional[str] = None
+
+
+class RecommendExplainRequest(BaseModel):
+    dataset_id: str
+    target: str
+    task_type: Optional[Literal["classification", "regression"]] = None
+
+
+# Legacy request models (original API)
+class DatasetRequest(BaseModel):
+    file_path: str
+    dataset_type: str = "tabular"
+    task_type: Optional[str] = None
+    target_column: Optional[str] = None
+
+
+class TrainingRequest(BaseModel):
+    experiment_name: str
+    algorithm: str
+    dataset_path: str
+    config: Dict[str, Any] = Field(default_factory=dict)
+    hyperparameters: Optional[Dict[str, Any]] = None
+    validation_split: float = 0.2
+    random_state: int = 42
+
+
+# ------------------------------------------------------------------ app
+def create_app(settings: Optional[Settings] = None, static_dir: Optional[Path] = None) -> FastAPI:
+    settings = settings or Settings()
+    store = Store(settings.db_path)
+    registry = DatasetRegistry(settings, store)
+    manager = JobManager(store, settings.models_dir, settings.max_concurrent_jobs)
+    llm = LLM(store)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        manager.bind_loop(asyncio.get_running_loop())
+        n = manager.recover_interrupted()
+        if n:
+            log.warning("Marked %d interrupted experiments as failed", n)
+        yield
+        manager.shutdown()
+
+    app = FastAPI(title="ML-Agent", version="2.0.0", lifespan=lifespan)
+    app.state.settings, app.state.store, app.state.registry = settings, store, registry
+    app.state.manager, app.state.llm = manager, llm
+
+    origins = [o.strip() for o in os.getenv("MLAGENT_CORS_ORIGINS", "*").split(",") if o.strip()]
+    app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=origins != ["*"],
+                       allow_methods=["*"], allow_headers=["*"])
+
+    api = APIRouter()
+
+    # -------------------------------------------------------------- helpers
+    def dataset_or_404(dataset_id: str) -> Dict[str, Any]:
+        meta = store.get_dataset(dataset_id)
+        if not meta:
+            raise HTTPException(404, "Dataset not found.")
+        return meta
+
+    async def load_df(dataset_id: str) -> pd.DataFrame:
+        dataset_or_404(dataset_id)
+        try:
+            return await run_in_threadpool(registry.load, dataset_id)
+        except DatasetError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    def experiment_or_404(exp_id: str) -> Dict[str, Any]:
+        exp = store.get_experiment(exp_id)
+        if not exp:
+            raise HTTPException(404, "Experiment not found.")
+        return exp
+
+    def resolve_legacy_path(file_path: str) -> Path:
+        """Old endpoints accepted arbitrary server paths. Only allow files inside
+        the managed dataset directory or the legacy uploads directory."""
+        p = Path(file_path).resolve()
+        allowed = [settings.datasets_dir.resolve(), settings.legacy_upload_dir.resolve(), SAMPLES_DIR.resolve()]
+        if not any(p.is_relative_to(a) for a in allowed):
+            raise HTTPException(403, "Only uploaded datasets can be accessed.")
+        if not p.is_file():
+            raise HTTPException(404, "File not found.")
+        return p
+
+    def legacy_dataset_id(file_path: str) -> str:
+        p = resolve_legacy_path(file_path)
+        meta = store.find_dataset_by_path(str(p))
+        if meta:
+            return meta["id"]
+        try:
+            return registry.register_existing_file(p)["id"]
+        except DatasetError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    # -------------------------------------------------------------- system
+    @api.get("/health")
+    async def health():
+        return {"status": "healthy", "timestamp": utcnow(), "version": app.version,
+                "active_jobs": manager.active_count()}
+
+    @api.get("/system")
+    async def system():
+        import platform
+
+        import numpy
+        import sklearn
+        return {
+            "version": app.version,
+            "llm": llm.status(),
+            "versions": {"python": platform.python_version(), "scikit_learn": sklearn.__version__,
+                         "pandas": pd.__version__, "numpy": numpy.__version__},
+            "xgboost_available": algs.XGBOOST_AVAILABLE,
+            "max_upload_mb": settings.max_upload_mb,
+            "max_concurrent_jobs": settings.max_concurrent_jobs,
+            "disclaimer": DISCLAIMER,
+        }
+
+    @api.get("/settings")
+    async def get_settings():
+        return {"llm": llm.config(), "status": llm.status()}
+
+    @api.put("/settings")
+    async def put_settings(values: Dict[str, Any]):
+        try:
+            cfg = llm.update_config(values)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {"llm": cfg, "status": llm.status()}
+
+    @api.post("/settings/test-llm")
+    async def test_llm():
+        return await run_in_threadpool(llm.status, True)
+
+    # -------------------------------------------------------------- datasets
+    @api.get("/datasets")
+    async def list_datasets():
+        datasets = registry.list()
+        counts: Dict[str, int] = {}
+        for e in store.list_experiments():
+            if e.get("dataset_id"):
+                counts[e["dataset_id"]] = counts.get(e["dataset_id"], 0) + 1
+        for d in datasets:
+            d["experiment_count"] = counts.get(d["id"], 0)
+            d.pop("path", None)
+        return {"datasets": datasets}
+
+    @api.post("/datasets")
+    async def upload_dataset(file: UploadFile = File(...)):
+        try:
+            meta = await run_in_threadpool(registry.register_upload, file.filename or "", file.file)
+        except DatasetError as exc:
+            raise HTTPException(422, str(exc)) from None
+        meta = dict(meta)
+        meta.pop("path", None)
+        return meta
+
+    @api.get("/datasets/{dataset_id}")
+    async def get_dataset(dataset_id: str):
+        meta = dict(dataset_or_404(dataset_id))
+        store.touch_dataset(dataset_id)
+        meta.pop("path", None)
+        if meta.get("parent_id"):
+            parent = store.get_dataset(meta["parent_id"])
+            meta["parent_name"] = parent["name"] if parent else None
+        return meta
+
+    @api.patch("/datasets/{dataset_id}")
+    async def rename_dataset(dataset_id: str, body: RenameRequest):
+        dataset_or_404(dataset_id)
+        store.rename_dataset(dataset_id, body.name.strip())
+        return await get_dataset(dataset_id)
+
+    @api.delete("/datasets/{dataset_id}")
+    async def delete_dataset(dataset_id: str):
+        dataset_or_404(dataset_id)
+        running = [e for e in store.list_experiments() if e.get("dataset_id") == dataset_id and e["status"] in ACTIVE]
+        if running:
+            raise HTTPException(409, "This dataset has experiments in progress.")
+        registry.delete(dataset_id)
+        return {"status": "deleted"}
+
+    @api.get("/datasets/{dataset_id}/profile")
+    async def dataset_profile(dataset_id: str):
+        df = await load_df(dataset_id)
+        return await run_in_threadpool(profiling.full_profile, df)
+
+    @api.get("/datasets/{dataset_id}/rows")
+    async def dataset_rows(dataset_id: str, offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=500),
+                           sort: Optional[str] = None, order: Literal["asc", "desc"] = "asc",
+                           search: Optional[str] = None, column: Optional[str] = None,
+                           missing_only: bool = False):
+        df = await load_df(dataset_id)
+
+        def work():
+            view = df
+            if search:
+                cols = [column] if column and column in df.columns else list(df.columns)
+                needle = search.lower()
+                mask = pd.Series(False, index=df.index)
+                for c in cols:
+                    mask |= df[c].astype(str).str.lower().str.contains(needle, regex=False, na=False)
+                view = view[mask]
+            if missing_only:
+                view = view[view.isna().any(axis=1)]
+            if sort:
+                if sort not in df.columns:
+                    raise HTTPException(400, f"Unknown column '{sort}'.")
+                view = view.sort_values(sort, ascending=order == "asc", na_position="last", kind="mergesort")
+            page = view.iloc[offset: offset + limit]
+            return {
+                "columns": list(df.columns),
+                "dtypes": {c: str(df[c].dtype) for c in df.columns},
+                "total": int(len(df)), "filtered": int(len(view)),
+                "offset": offset, "limit": limit,
+                "index": [int(i) for i in page.index],
+                "rows": clean_json(page.to_numpy(dtype=object).tolist()),
+            }
+        return await run_in_threadpool(work)
+
+    @api.get("/datasets/{dataset_id}/columns/{column}")
+    async def column_detail(dataset_id: str, column: str):
+        df = await load_df(dataset_id)
+        try:
+            return await run_in_threadpool(profiling.column_detail, df, column)
+        except DatasetError as exc:
+            raise HTTPException(404, str(exc)) from None
+
+    @api.get("/datasets/{dataset_id}/correlations")
+    async def dataset_correlations(dataset_id: str):
+        df = await load_df(dataset_id)
+        return await run_in_threadpool(profiling.correlations, df)
+
+    @api.get("/datasets/{dataset_id}/missing")
+    async def dataset_missing(dataset_id: str):
+        df = await load_df(dataset_id)
+        return await run_in_threadpool(profiling.missing_pattern, df)
+
+    @api.get("/datasets/{dataset_id}/scatter")
+    async def dataset_scatter(dataset_id: str, x: str, y: str, color: Optional[str] = None):
+        df = await load_df(dataset_id)
+        try:
+            return await run_in_threadpool(profiling.scatter, df, x, y, color)
+        except DatasetError as exc:
+            raise HTTPException(404, str(exc)) from None
+
+    @api.get("/datasets/{dataset_id}/quality")
+    async def dataset_quality(dataset_id: str, target: Optional[str] = None):
+        df = await load_df(dataset_id)
+        if target and target not in df.columns:
+            raise HTTPException(400, f"Unknown target column '{target}'.")
+        return {"findings": await run_in_threadpool(profiling.quality_findings, df, target)}
+
+    @api.get("/datasets/{dataset_id}/target")
+    async def dataset_target(dataset_id: str, target: str, task_type: Optional[str] = None):
+        df = await load_df(dataset_id)
+        try:
+            analysis = await run_in_threadpool(profiling.target_analysis, df, target)
+        except DatasetError as exc:
+            raise HTTPException(400, str(exc)) from None
+        task = task_type if task_type in ("classification", "regression") else analysis["problem_type"]
+        rec = await run_in_threadpool(recommend.recommend, df, target, task) if task else None
+        return {"analysis": analysis, "recommendation": rec}
+
+    @api.post("/datasets/{dataset_id}/clean")
+    async def dataset_clean(dataset_id: str, body: CleanRequest):
+        await load_df(dataset_id)
+        try:
+            meta = await run_in_threadpool(registry.apply_actions, dataset_id, body.actions)
+        except DatasetError as exc:
+            raise HTTPException(400, str(exc)) from None
+        meta = dict(meta)
+        meta.pop("path", None)
+        return meta
+
+    @api.get("/datasets/{dataset_id}/download")
+    async def dataset_download(dataset_id: str):
+        meta = dataset_or_404(dataset_id)
+        return FileResponse(meta["path"], filename=meta["filename"] or f"{dataset_id}.csv")
+
+    @api.get("/samples")
+    async def list_samples():
+        out = []
+        for p in sorted(SAMPLES_DIR.glob("*.csv")):
+            out.append({"name": p.stem, "filename": p.name, "size_bytes": p.stat().st_size})
+        return {"samples": out}
+
+    @api.post("/samples/{name}/import")
+    async def import_sample(name: str):
+        path = SAMPLES_DIR / f"{safe_filename(name)}.csv"
+        if not path.is_file():
+            raise HTTPException(404, "Sample not found.")
+        meta = dict(await run_in_threadpool(registry.register_existing_file, path, path.name))
+        meta.pop("path", None)
+        return meta
+
+    # -------------------------------------------------------------- algorithms
+    @api.get("/algorithms")
+    async def list_algorithms(task: Optional[str] = None):
+        return {"algorithms": [a.to_dict() for a in algs.for_task(task)]}
+
+    @api.post("/recommendations/explain")
+    async def explain_recommendations(body: RecommendExplainRequest):
+        df = await load_df(body.dataset_id)
+        if body.target not in df.columns:
+            raise HTTPException(400, "Unknown target column.")
+        rec = await run_in_threadpool(recommend.recommend, df, body.target, body.task_type)
+        try:
+            return await run_in_threadpool(llm.explain_recommendations, rec, body.target)
+        except LLMUnavailable as exc:
+            raise HTTPException(503, str(exc)) from None
+        except Exception as exc:
+            raise HTTPException(502, f"AI provider error: {exc}") from None
+
+    # -------------------------------------------------------------- experiments
+    def start_experiments(body: ExperimentCreate, df: pd.DataFrame) -> Dict[str, Any]:
+        meta = dataset_or_404(body.dataset_id)
+        resolved_all = []
+        for spec in body.algorithms:
+            cfg = {"target": body.target, "task_type": body.task_type, "algorithm_id": spec.id,
+                   "hyperparameters": spec.hyperparameters, "preprocessing": body.preprocessing,
+                   "split": body.split, "options": body.options}
+            try:
+                resolved = validate_config(cfg, df)
+            except TrainingError as exc:
+                raise HTTPException(400, str(exc)) from None
+            resolved_all.append(resolved)
+        if len({fingerprint(body.dataset_id, r) for r in resolved_all}) != len(resolved_all):
+            raise HTTPException(400, "The same algorithm configuration is listed twice.")
+        group_id = uuid.uuid4().hex[:10] if len(resolved_all) > 1 else None
+        created = []
+        for resolved in resolved_all:
+            fp = fingerprint(body.dataset_id, resolved)
+            alg = algs.get(resolved["algorithm_id"])
+            exp_id = str(uuid.uuid4())
+            name = (body.name or f"{meta['name']} · {resolved['target']}").strip()
+            if len(resolved_all) > 1:
+                name = f"{name} · {alg.name}"
+            exp = {"id": exp_id, "name": name[:160], "algorithm": alg.name, "algorithm_id": alg.id,
+                   "dataset_id": body.dataset_id, "dataset_path": meta["path"],
+                   "config": {**resolved, "dataset_id": body.dataset_id, "dataset_name": meta["name"]},
+                   "status": "queued", "metrics": {}, "logs": [], "results": {}, "training_time": 0,
+                   "created_at": utcnow(), "task_type": resolved["task_type"], "target": resolved["target"],
+                   "group_id": group_id, "fingerprint": fp}
+            try:
+                # reserve the fingerprint before persisting, so duplicates are rejected atomically
+                work = make_work(lambda: registry.load(body.dataset_id), resolved, meta, manager)
+
+                def with_quality(job, _work=work, _target=resolved["target"]):
+                    out = _work(job)
+                    out["results"]["data_quality"] = profiling.quality_findings(registry.load(body.dataset_id), _target)
+                    return out
+                store.save_experiment(exp)
+                manager.submit(exp_id, fp, with_quality)
+            except DuplicateJob as dup:
+                store.delete_experiment(exp_id)
+                for c in created:  # roll back the batch
+                    manager.cancel(c["id"])
+                raise HTTPException(409, {"message": "An identical experiment is already running.",
+                                          "experiment_id": dup.existing_id}) from None
+            created.append({"id": exp_id, "algorithm_id": alg.id, "name": exp["name"]})
+        return {"group_id": group_id, "experiments": created}
+
+    @api.post("/experiments")
+    async def create_experiments(body: ExperimentCreate):
+        df = await load_df(body.dataset_id)
+        return await run_in_threadpool(start_experiments, body, df)
+
+    @api.get("/experiments")
+    async def list_experiments(dataset_id: Optional[str] = None, status: Optional[str] = None):
+        exps = store.list_experiments()
+        if dataset_id:
+            exps = [e for e in exps if e.get("dataset_id") == dataset_id]
+        if status:
+            exps = [e for e in exps if e["status"] == status]
+        return {"status": "success", "experiments": exps}
+
+    @api.get("/experiments/{exp_id}")
+    async def get_experiment(exp_id: str):
+        exp = experiment_or_404(exp_id)
+        job = manager.jobs.get(exp_id)
+        if job and job.status in ACTIVE:
+            exp["logs"] = list(job.events)
+        return {"status": "success", "experiment": exp}
+
+    @api.patch("/experiments/{exp_id}")
+    async def rename_experiment(exp_id: str, body: RenameRequest):
+        experiment_or_404(exp_id)
+        store.update_experiment(exp_id, name=body.name.strip())
+        return {"status": "success"}
+
+    @api.post("/experiments/{exp_id}/cancel")
+    async def cancel_experiment(exp_id: str):
+        exp = experiment_or_404(exp_id)
+        if exp["status"] in TERMINAL:
+            raise HTTPException(409, f"Experiment already {exp['status']}.")
+        if not manager.cancel(exp_id):
+            raise HTTPException(409, "Experiment is not running in this server process.")
+        return {"status": "cancelling"}
+
+    @api.delete("/experiments/{exp_id}")
+    async def delete_experiment(exp_id: str):
+        exp = experiment_or_404(exp_id)
+        if exp["status"] in ACTIVE:
+            manager.cancel(exp_id)
+        store.delete_experiment(exp_id)
+        (settings.models_dir / f"{exp_id}.joblib").unlink(missing_ok=True)
+        return {"status": "success", "message": "Experiment deleted"}
+
+    def completed(exp_id: str) -> Dict[str, Any]:
+        exp = experiment_or_404(exp_id)
+        if exp["status"] != "completed" or not exp.get("results"):
+            raise HTTPException(409, f"Experiment is {exp['status']}; this requires a completed experiment.")
+        return exp
+
+    def build_report(exp_id: str) -> Dict[str, Any]:
+        exp = completed(exp_id)
+        ds = store.get_dataset(exp.get("dataset_id") or "")
+        quality = exp["results"].get("data_quality")
+        return reports.build(exp, ds, quality)
+
+    @api.get("/experiments/{exp_id}/report")
+    async def get_report(exp_id: str):
+        return {"status": "success", "report": build_report(exp_id)}
+
+    @api.post("/experiments/{exp_id}/report/narrative")
+    async def report_narrative(exp_id: str):
+        rep = build_report(exp_id)
+        facts = {k: rep[k] for k in ("task", "target", "algorithm", "primary_metric", "observations", "limitations")}
+        facts["metrics"] = {k: rep["metrics"][k] for k in ("test", "train", "baseline")}
+        facts["cv"] = (rep["metrics"].get("cv") or {}).get("mean")
+        facts["rows"] = rep["methodology"]["rows"]
+        try:
+            ai = await run_in_threadpool(llm.report_narrative, facts)
+        except LLMUnavailable as exc:
+            raise HTTPException(503, str(exc)) from None
+        except Exception as exc:
+            raise HTTPException(502, f"AI provider error: {exc}") from None
+        exp = store.get_experiment(exp_id)
+        results = exp["results"]
+        results["ai_narrative"] = {**ai, "generated_at": utcnow()}
+        store.update_experiment(exp_id, results=results)
+        return results["ai_narrative"]
+
+    @api.get("/experiments/{exp_id}/export-report")
+    async def export_report(exp_id: str, format: Literal["txt", "md"] = "txt"):
+        rep = build_report(exp_id)
+        exp = store.get_experiment(exp_id)
+        ai = exp["results"].get("ai_narrative")
+        body = reports.to_markdown(rep, ai) if format == "md" else reports.to_text(rep, ai)
+        fname = f"ML-Agent_Report_{safe_filename(exp['name'], 'experiment')}.{format}"
+        return PlainTextResponse(body, media_type="text/markdown" if format == "md" else "text/plain",
+                                 headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+    @api.get("/experiments/{exp_id}/export-model")
+    async def export_model(exp_id: str):
+        exp = completed(exp_id)
+        path = settings.models_dir / f"{exp_id}.joblib"
+        if not path.exists():
+            raise HTTPException(404, "Model file not found.")
+        return FileResponse(path, media_type="application/octet-stream",
+                            filename=f"ML-Agent_{safe_filename(exp['name'], 'model')}.joblib")
+
+    @api.post("/experiments/{exp_id}/predict")
+    async def predict(exp_id: str, body: PredictRequest):
+        completed(exp_id)
+        path = settings.models_dir / f"{exp_id}.joblib"
+        if not path.exists():
+            raise HTTPException(404, "Model file not found.")
+
+        def work():
+            bundle = joblib.load(path)
+            cols = bundle["feature_columns"]
+            frame = pd.DataFrame(body.rows)
+            missing = [c for c in cols if c not in frame.columns]
+            if missing:
+                raise HTTPException(400, f"Rows are missing feature columns: {', '.join(missing)}")
+            frame = frame[cols]
+            for c in bundle["numeric"]:
+                frame[c] = pd.to_numeric(frame[c], errors="coerce")
+            pipe = bundle["pipeline"]
+            pred = pipe.predict(frame)
+            out = {"predictions": [], "task": bundle["task"]}
+            proba = None
+            if bundle["task"] == "classification" and hasattr(pipe, "predict_proba"):
+                try:
+                    proba = pipe.predict_proba(frame)
+                except AttributeError:
+                    proba = None
+            for i, p in enumerate(pred):
+                item: Dict[str, Any] = {"prediction": bundle["classes"][int(p)] if bundle["classes"] else float(p)}
+                if proba is not None:
+                    item["probabilities"] = {bundle["classes"][int(c)]: float(v) for c, v in zip(pipe.classes_, proba[i])}
+                out["predictions"].append(item)
+            return clean_json(out)
+        return await run_in_threadpool(work)
+
+    # -------------------------------------------------------------- research
+    @api.get("/papers/search")
+    async def papers_search(q: str, limit: int = Query(10, ge=1, le=30), sort: Literal["relevance", "date"] = "relevance",
+                            explain: bool = False):
+        try:
+            found = await run_in_threadpool(paper_search.search, q, limit, sort)
+        except paper_search.PaperSearchError as exc:
+            raise HTTPException(502, str(exc)) from None
+        out: Dict[str, Any] = {"query": q, "papers": found, "source": "arXiv", "ai": None}
+        if explain and found:
+            try:
+                out["ai"] = await run_in_threadpool(llm.paper_relevance, q, found)
+            except LLMUnavailable as exc:
+                out["ai_error"] = str(exc)
+            except Exception as exc:
+                out["ai_error"] = f"AI provider error: {exc}"
+        return out
+
+    @api.post("/papers/summarize")
+    async def papers_summarize(body: SummarizeRequest):
+        try:
+            return await run_in_threadpool(llm.summarize_paper, body.model_dump(), body.context)
+        except LLMUnavailable as exc:
+            raise HTTPException(503, str(exc)) from None
+        except Exception as exc:
+            raise HTTPException(502, f"AI provider error: {exc}") from None
+
+    # -------------------------------------------------------------- legacy API
+    @api.post("/upload-dataset")
+    async def legacy_upload(file: UploadFile = File(...)):
+        meta = await upload_dataset(file)
+        full = store.get_dataset(meta["id"])
+        return {"status": "success", "file_path": full["path"], "filename": meta["filename"], "dataset_id": meta["id"]}
+
+    @api.post("/get-dataset-preview")
+    async def legacy_preview(file_path: str, rows: int = Query(20, ge=1, le=500)):
+        ds_id = legacy_dataset_id(file_path)
+        page = await dataset_rows(ds_id, offset=0, limit=rows)
+        return {"status": "success", "columns": page["columns"], "dtypes": page["dtypes"],
+                "data": [dict(zip(page["columns"], r)) for r in page["rows"]], "total_rows": page["total"]}
+
+    @api.post("/analyze-dataset")
+    async def legacy_analyze(request: DatasetRequest):
+        if request.dataset_type != "tabular":
+            raise HTTPException(400, "Only tabular datasets are supported.")
+        ds_id = legacy_dataset_id(request.file_path)
+        df = await load_df(ds_id)
+        ov = await run_in_threadpool(profiling.overview, df)
+        target = request.target_column if request.target_column in df.columns else None
+        guess = target or df.columns[-1]
+        det = profiling.detect_problem_type(df[guess])
+        num = ov["numeric_columns"]
+        analysis = {
+            "rows": ov["rows"], "columns": ov["columns"], "column_names": list(df.columns),
+            "data_types": {c: str(df[c].dtype) for c in df.columns},
+            "missing_values": {c["name"]: c["missing"] for c in ov["column_info"]},
+            "duplicate_rows": ov["duplicate_rows"], "numeric_features": num,
+            "categorical_features": ov["categorical_columns"],
+            "numeric_stats": clean_json(df[num].describe().to_dict()) if num else {},
+            "target_column": guess, "task_type": det["problem_type"],
+            "explanation": ("Target provided by the user. " if target else
+                            "No target supplied; showing the last column — confirm it in Model Studio. ") + det["reason"],
+            "dataset_id": ds_id,
+        }
+        return {"status": "success", "analysis": analysis}
+
+    @api.post("/recommend-algorithm")
+    async def legacy_recommend(request: DatasetRequest):
+        ds_id = legacy_dataset_id(request.file_path)
+        df = await load_df(ds_id)
+        target = request.target_column if request.target_column in df.columns else df.columns[-1]
+        task = request.task_type if request.task_type in ("classification", "regression") else None
+        rec = await run_in_threadpool(recommend.recommend, df, target, task)
+        top = next((a for a in rec["algorithms"] if a["compatible"]), None)
+        if not top:
+            raise HTTPException(422, "No compatible algorithm for this target.")
+        alg = algs.get(top["id"])
+        return {"status": "success", "recommendation": {
+            "algorithm": alg.name, "algorithm_id": alg.id, "confidence": None,
+            "reasoning": " ".join(top["reasons"]), "hyperparameters": alg.validate_params({}),
+            "expected_performance": "Not estimated. Train the model to measure performance.",
+            "pros": alg.strengths, "cons": alg.limitations + top["cautions"],
+            "method": rec["method"]}}
+
+    @api.post("/train-model")
+    async def legacy_train(request: TrainingRequest):
+        ds_id = legacy_dataset_id(request.dataset_path)
+        df = await load_df(ds_id)
+        target = request.config.get("target_column")
+        if not target or target not in df.columns:
+            raise HTTPException(400, f"config.target_column '{target}' is not a column of the dataset.")
+        task = request.config.get("task_type") or "auto"
+        if task == "auto":
+            task = profiling.detect_problem_type(df[target])["problem_type"]
+        try:
+            alg = algs.resolve_name(request.algorithm, task)
+        except algs.AlgorithmError as exc:
+            raise HTTPException(400, str(exc)) from None
+        hyper = {k: v for k, v in (request.hyperparameters or {}).items() if k in {p.name for p in alg.params}}
+        body = ExperimentCreate(dataset_id=ds_id, target=target, name=request.experiment_name, task_type=task,
+                                algorithms=[AlgorithmSpec(id=alg.id, hyperparameters=hyper)],
+                                split={"test_size": min(max(request.validation_split, 0.05), 0.5),
+                                       "random_state": request.random_state})
+        out = await run_in_threadpool(start_experiments, body, df)
+        return {"status": "success", "experiment_id": out["experiments"][0]["id"], "message": "Training started"}
+
+    @api.post("/search-papers")
+    async def legacy_search(query: str, limit: int = 5):
+        try:
+            found = await run_in_threadpool(paper_search.search, query, limit, "relevance")
+        except paper_search.PaperSearchError as exc:
+            raise HTTPException(502, str(exc)) from None
+        papers = [{**p, "authors": ", ".join(p["authors"][:3]), "summary": p["abstract"]} for p in found]
+        return {"status": "success", "papers": papers, "count": len(papers)}
+
+    app.include_router(api)
+    app.include_router(api, prefix="/api")
+
+    # -------------------------------------------------------------- websocket
+    async def stream(websocket: WebSocket, exp_id: str):
+        await websocket.accept()
+        exp = store.get_experiment(exp_id)
+        if not exp:
+            await websocket.send_json({"type": "error", "message": "Experiment not found."})
+            await websocket.close(code=4404)
+            return
+        queue, history = manager.subscribe(exp_id)
+        try:
+            if queue is None:
+                # Not running in this process: replay the persisted log and final state.
+                for evt in exp.get("logs") or []:
+                    await websocket.send_json(evt)
+                await websocket.send_json({"type": "status", "status": exp["status"], "terminal": exp["status"] in TERMINAL,
+                                           "message": exp.get("error") or exp["status"], "error": exp.get("error"),
+                                           "summary": exp.get("metrics"), "experiment_id": exp_id})
+                return
+            last_seq = 0
+            for evt in history:
+                await websocket.send_json(evt)
+                last_seq = evt["seq"]
+                if evt.get("terminal"):
+                    return
+            while True:
+                try:
+                    evt = await asyncio.wait_for(queue.get(), timeout=25)
+                except asyncio.TimeoutError:
+                    await websocket.send_json({"type": "heartbeat"})
+                    continue
+                if evt["seq"] <= last_seq:
+                    continue
+                await websocket.send_json(evt)
+                last_seq = evt["seq"]
+                if evt.get("terminal"):
+                    return
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            if queue is not None:
+                manager.unsubscribe(exp_id, queue)
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass
+
+    for prefix in ("", "/api"):
+        app.add_api_websocket_route(f"{prefix}/ws/experiments/{{exp_id}}", stream)
+        app.add_api_websocket_route(f"{prefix}/ws/train/{{exp_id}}", stream)
+
+    # -------------------------------------------------------------- SPA
+    static_dir = static_dir or (BACKEND_DIR / "static")
+    if static_dir.is_dir() and (static_dir / "index.html").exists():
+        index = static_dir / "index.html"
+        if (static_dir / "assets").is_dir():
+            app.mount("/assets", StaticFiles(directory=static_dir / "assets"), name="assets")
+
+        @app.middleware("http")
+        async def spa_fallback(request: Request, call_next):
+            path = request.url.path
+            if (request.method == "GET" and "text/html" in request.headers.get("accept", "")
+                    and not path.startswith(("/api", "/ws", "/docs", "/openapi", "/redoc", "/assets"))):
+                candidate = (static_dir / path.lstrip("/")).resolve()
+                if path != "/" and candidate.is_file() and candidate.is_relative_to(static_dir.resolve()):
+                    return FileResponse(candidate)
+                return FileResponse(index)
+            return await call_next(request)
+
+        @app.get("/{asset_path:path}", include_in_schema=False)
+        async def static_files(asset_path: str):
+            candidate = (static_dir / asset_path).resolve()
+            if asset_path and candidate.is_file() and candidate.is_relative_to(static_dir.resolve()):
+                return FileResponse(candidate)
+            raise HTTPException(404, "Not found")
+
+    @app.exception_handler(HTTPException)
+    async def http_error(request: Request, exc: HTTPException):
+        detail = exc.detail
+        payload = detail if isinstance(detail, dict) else {"message": str(detail)}
+        payload.setdefault("message", "Request failed")
+        return JSONResponse({"detail": payload["message"], **payload}, status_code=exc.status_code)
+
+    return app
+
+
+app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=port)

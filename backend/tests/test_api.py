@@ -256,3 +256,13 @@ def test_legacy_endpoints_reject_bad_input(client):
     bad_target = client.post("/train-model", json={"experiment_name": "x", "algorithm": "Ridge", "dataset_path": path,
                                                    "config": {"target_column": "zz"}})
     assert bad_target.status_code == 400
+
+
+def test_persisted_log_has_unique_sequence_numbers(client):
+    ds = upload(client, make_regression(n=80))
+    eid = client.post("/api/experiments", json={"dataset_id": ds, "target": "target",
+                                                "algorithms": [{"id": "ridge"}]}).json()["experiments"][0]["id"]
+    exp = wait(client, eid)
+    seqs = [e["seq"] for e in exp["logs"]]
+    assert len(seqs) == len(set(seqs)) and seqs == sorted(seqs)
+    assert exp["logs"][-1]["terminal"] is True and exp["logs"][-1]["status"] == "completed"

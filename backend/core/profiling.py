@@ -224,7 +224,7 @@ def scatter(df: pd.DataFrame, x: str, y: str, color: Optional[str] = None, limit
         sub = sub.sample(limit, random_state=0)
     groups = None
     if color:
-        top = df[color].astype(str).value_counts().head(7).index.tolist()
+        top = df[color].astype(str).value_counts().head(3).index.tolist()  # 3 hues validate all-pairs
         sub[color] = sub[color].astype(str).where(sub[color].astype(str).isin(top), "Other")
         groups = top + (["Other"] if (sub[color] == "Other").any() else [])
     points = [
@@ -259,6 +259,18 @@ def quality_findings(df: pd.DataFrame, target: Optional[str] = None) -> List[Dic
             "Identical rows can land in both the training and test split, which inflates test scores. "
             "Model Studio drops exact duplicates before splitting by default.",
             action={"type": "drop_duplicates", "params": {}, "label": "Drop duplicate rows"})
+    else:
+        id_cols = [c for c, k in kinds.items() if k["kind"] == "identifier" and c != target]
+        rest = [c for c in df.columns if c not in id_cols]
+        if id_cols and rest:
+            near = int(df.duplicated(subset=rest).sum())
+            if near:
+                add("duplicates_ignoring_ids", "warning",
+                    f"{near} rows duplicate other rows apart from {', '.join(id_cols)}",
+                    "These rows are identical in every other column, so they can sit in both the training and test "
+                    "split. Model Studio drops them before splitting by default (identifiers are excluded from training).",
+                    id_cols, {"type": "drop_duplicates", "params": {"subset": rest},
+                              "label": f"Drop duplicates (ignoring {', '.join(id_cols)})"})
 
     for c, k in kinds.items():
         if c == target:

@@ -1,23 +1,25 @@
-version: '3.8'
-
 services:
   backend:
     build: ./backend
     ports:
       - "8000:8000"
-    volumes:
-      - ./backend/uploads:/app/uploads
-      - ./backend/ml_engineer.db:/app/ml_engineer.db
+    environment:
+      - MLAGENT_DATA_DIR=/app/var
     env_file:
-      - ./.env
-    restart: always
+      - path: ./.env
+        required: false
+    volumes:
+      - mlagent-data:/app/var       # datasets, models, SQLite database
+      - ./data:/data:ro              # sample datasets
+    restart: unless-stopped
 
   frontend:
     build: ./frontend
     ports:
-      - "80:80"
-    environment:
-      - VITE_API_URL=http://localhost:8000
+      - "8080:80"
     depends_on:
       - backend
-    restart: always
+    restart: unless-stopped
+
+volumes:
+  mlagent-data:

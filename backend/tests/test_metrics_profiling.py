@@ -158,3 +158,20 @@ def test_scatter_sampling():
     sc = profiling.scatter(df, "a", "target", color="kind", limit=500)
     assert sc["shown"] == 500 and sc["total"] == 5000
     assert set(sc["groups"]) <= {"x", "y", "z"}
+
+
+def test_duplicates_hidden_by_identifier_are_flagged_and_removable(settings):
+    from core.datasets import DatasetRegistry
+    from core.store import Store
+    rng = np.random.default_rng(9)
+    base = pd.DataFrame({"x": rng.normal(size=40), "y": rng.choice(["a", "b"], 40)})
+    df = pd.concat([base, base.iloc[:6]], ignore_index=True)
+    df.insert(0, "row_id", np.arange(1, len(df) + 1))
+    findings = {f["id"]: f for f in profiling.quality_findings(df)}
+    assert "duplicates" not in findings
+    f = findings["duplicates_ignoring_ids"]
+    assert f["title"].startswith("6 rows")
+    reg = DatasetRegistry(settings, Store(settings.db_path))
+    meta = reg.register_dataframe(df, "t", None, "")
+    new = reg.apply_actions(meta["id"], [f["action"]])
+    assert new["n_rows"] == 40 and "row_id" in reg.load(new["id"]).columns

@@ -108,16 +108,19 @@ class JobManager:
     def _finish(self, job: Job, status: str, error: Optional[str] = None, summary=None) -> None:
         job.status = status
         elapsed = round(time.time() - job.started, 3) if job.started else 0
-        fields: Dict[str, Any] = {"status": status, "completed_at": utcnow(), "error": error,
-                                  "logs": job.events + [{"type": "status", "status": status, "message": error or status}]}
-        if status != "completed":
-            fields["training_time"] = elapsed
-        self.store.update_experiment(job.exp_id, **fields)
         evt = {"type": "status", "status": status, "message": error or "Training completed", "terminal": True}
         if summary is not None:
             evt["summary"] = summary
         if error:
             evt["error"] = error
+        # Persist first (so a client reacting to the terminal event reads final state), with the
+        # terminal event included in the stored log under the sequence number it will be published with.
+        stored_evt = clean_json({**evt, "seq": len(job.events) + 1, "time": utcnow(), "experiment_id": job.exp_id})
+        fields: Dict[str, Any] = {"status": status, "completed_at": utcnow(), "error": error,
+                                  "logs": job.events + [stored_evt]}
+        if status != "completed":
+            fields["training_time"] = elapsed
+        self.store.update_experiment(job.exp_id, **fields)
         self._publish(job, evt)
 
     # ---------------------------------------------------------------- events

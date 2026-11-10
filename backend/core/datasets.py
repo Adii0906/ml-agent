@@ -256,8 +256,10 @@ class DatasetRegistry:
             params = action.get("params") or {}
             if kind == "drop_duplicates":
                 before = len(df)
-                df = df.drop_duplicates().reset_index(drop=True)
-                applied.append(f"Dropped {before - len(df)} duplicate rows")
+                subset = [c for c in params.get("subset") or [] if c in df.columns] or None
+                df = df.drop_duplicates(subset=subset).reset_index(drop=True)
+                applied.append(f"Dropped {before - len(df)} duplicate rows"
+                               + (f" (ignoring {', '.join(c for c in df.columns if c not in subset)})" if subset else ""))
             elif kind == "drop_columns":
                 cols = [c for c in params.get("columns", []) if c in df.columns]
                 if not cols:

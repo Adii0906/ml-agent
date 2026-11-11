@@ -21,10 +21,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import joblib
+import os
 
 from .store import Store
 from .training import Cancelled, TrainingError, run_training
-from .util import clean_json, utcnow
+from .util import clean_json, sha256_file as file_sha256, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -92,7 +93,18 @@ class JobManager:
             out = work(job)
             model_path = self.models_dir / f"{job.exp_id}.joblib"
             self.emit(job, stage="persist", stage_index=6, stage_count=7, message="Serialising fitted pipeline")
-            joblib.dump(out["bundle"], model_path)
+            tmp_path = model_path.with_suffix(".joblib.partial")
+            joblib.dump(out["bundle"], tmp_path)
+            os.replace(tmp_path, model_path)  # atomic: never leave a half-written artifact
+            if self.store.get_experiment(job.exp_id) is None:
+                # Experiment was deleted while training: do not leave an orphaned artifact behind.
+                model_path.unlink(missing_ok=True)
+                job.status = "cancelled"
+                self._publish(job, {"type": "status", "status": "cancelled", "terminal": True,
+                                    "message": "Experiment was deleted; its artifact was discarded."})
+                return
+            out["results"]["artifact"] = {"sha256": file_sha256(model_path), "bytes": model_path.stat().st_size,
+                                          "format": "joblib"}
             elapsed = round(time.time() - job.started, 3)
             self.store.update_experiment(job.exp_id, results=out["results"], metrics=out["summary"],
                                          training_time=elapsed)

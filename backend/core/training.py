@@ -569,6 +569,7 @@ def run_training(df: pd.DataFrame, resolved: Dict[str, Any], dataset_meta: Dict[
             "n_train": int(len(X_train)), "n_test": int(len(X_test)),
             "classes": classes,
             "features": {k: features[k] for k in ("numeric", "categorical", "excluded", "skipped")},
+            "feature_dtypes": {c: str(X[c].dtype) for c in feature_cols},
             "encoded_features": encoded_features,
         },
         "preprocessing": {**prep, "scaling_resolved": resolve_scaling(prep, alg.scale_sensitive)},

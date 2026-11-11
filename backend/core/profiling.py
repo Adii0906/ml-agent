@@ -293,6 +293,14 @@ def quality_findings(df: pd.DataFrame, target: Optional[str] = None) -> List[Dic
             add(f"datetime:{c}", "info", f"'{c}' contains dates",
                 "Date columns are excluded by default. Derive numeric features (year, month, elapsed days) if they matter.", [c])
 
+    for c, k in kinds.items():
+        if k["kind"] == "numeric" and pd.api.types.is_float_dtype(df[c]):
+            n_inf = int(np.isinf(df[c].to_numpy(dtype=float)).sum())
+            if n_inf:
+                add(f"infinite:{c}", "warning", f"'{c}' contains {n_inf} infinite values",
+                    "Infinite values are treated as missing and imputed during training. Check how they were produced "
+                    "(e.g. division by zero).", [c])
+
     miss = df.isna().mean()
     for c, pct in miss.items():
         if c == target or pct == 0 or kinds[c]["kind"] == "empty":

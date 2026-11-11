@@ -11,12 +11,14 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_selection import SelectKBest, VarianceThreshold, f_classif, f_regression
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, MinMaxScaler, OneHotEncoder, OrdinalEncoder, RobustScaler, StandardScaler
+
+from mlagent_runtime import IQRClipper as _RuntimeIQRClipper
+from mlagent_runtime import categorical_to_str, infinite_to_nan
 
 from .datasets import DEFAULT_EXCLUDED_KINDS, column_kinds
 
@@ -48,35 +50,11 @@ _CHOICES = {
 }
 
 
-class IQRClipper(BaseEstimator, TransformerMixin):
-    """Clip each numeric column to [Q1 - k·IQR, Q3 + k·IQR] using fences learned in ``fit``."""
-
-    def __init__(self, k: float = 1.5):
-        self.k = k
-
-    def fit(self, X, y=None):
-        X = np.asarray(X, dtype=float)
-        q1 = np.nanpercentile(X, 25, axis=0)
-        q3 = np.nanpercentile(X, 75, axis=0)
-        iqr = q3 - q1
-        self.lower_ = q1 - self.k * iqr
-        self.upper_ = q3 + self.k * iqr
-        self.n_features_in_ = X.shape[1]
-        return self
-
-    def transform(self, X):
-        X = np.asarray(X, dtype=float)
-        return np.clip(X, self.lower_, self.upper_)
-
-    def get_feature_names_out(self, input_features=None):
-        return np.asarray(input_features if input_features is not None else [f"x{i}" for i in range(self.n_features_in_)], dtype=object)
-
-
-def _to_str(X):
-    """Categorical values as strings so mixed int/str columns encode consistently."""
-    if isinstance(X, pd.DataFrame):
-        return X.apply(lambda s: s.astype(str).astype(object).where(s.notna(), np.nan))
-    return X
+# The custom transformers live in the standalone ``mlagent_runtime`` module so that saved
+# artifacts can be loaded without the ML-Agent server. These aliases keep artifacts that were
+# pickled before the move (which reference ``core.pipeline``) loadable.
+IQRClipper = _RuntimeIQRClipper
+_to_str = categorical_to_str
 
 
 def validate_preprocessing(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -141,7 +119,7 @@ def build_pipeline(estimator, features: Dict[str, Any], cfg: Dict[str, Any], sca
             imputer = SimpleImputer(strategy="constant", fill_value=0)
         else:
             imputer = SimpleImputer(strategy=cfg["numeric_imputation"])
-        steps = [("impute", imputer)]
+        steps = [("finite", FunctionTransformer(infinite_to_nan, feature_names_out="one-to-one")), ("impute", imputer)]
         if cfg["outliers"] == "clip_iqr":
             steps.append(("clip", IQRClipper(1.5)))
         scaler = {"standard": StandardScaler(), "minmax": MinMaxScaler(), "robust": RobustScaler()}.get(scaling)
@@ -158,7 +136,7 @@ def build_pipeline(estimator, features: Dict[str, Any], cfg: Dict[str, Any], sca
                                     max_categories=50, sparse_output=False)
         else:
             encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-        cat_steps = [("to_str", FunctionTransformer(_to_str, feature_names_out="one-to-one")),
+        cat_steps = [("to_str", FunctionTransformer(categorical_to_str, feature_names_out="one-to-one")),
                      ("impute", cat_imputer), ("encode", encoder)]
         if cfg["encoding"] == "ordinal" and scaling != "none":
             cat_steps.append(("scale", StandardScaler()))
@@ -186,7 +164,7 @@ def describe_pipeline(features: Dict[str, Any], cfg: Dict[str, Any], scale_sensi
     stages.append({"stage": "Train/test split", "fitted_on": "—", "detail": "Held-out test set is never used for fitting."})
     if features["numeric"]:
         imp = "constant 0" if cfg["numeric_imputation"] == "zero" else cfg["numeric_imputation"]
-        num_detail = f"{len(features['numeric'])} columns · impute {imp}"
+        num_detail = f"{len(features['numeric'])} columns · ±inf → missing · impute {imp}"
         if cfg["outliers"] == "clip_iqr":
             num_detail += " · clip to 1.5×IQR fences"
         num_detail += f" · scaling: {scaling}"

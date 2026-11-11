@@ -20,6 +20,8 @@ const ModelStudio = lazy(() => import('./pages/studio/ModelStudio'));
 const Experiments = lazy(() => import('./pages/Experiments'));
 const ExperimentDetail = lazy(() => import('./pages/experiment/ExperimentDetail'));
 const Compare = lazy(() => import('./pages/Compare'));
+const SavedModels = lazy(() => import('./pages/models/SavedModels'));
+const ModelDetail = lazy(() => import('./pages/models/ModelDetail'));
 const Research = lazy(() => import('./pages/Research'));
 const Reports = lazy(() => import('./pages/Reports'));
 const ReportView = lazy(() => import('./pages/ReportView'));
@@ -43,6 +45,8 @@ createRoot(document.getElementById('root')).render(
                     <Route path="experiments" element={<Experiments />} />
                     <Route path="experiments/:id" element={<ExperimentDetail />} />
                     <Route path="compare" element={<Compare />} />
+                    <Route path="models" element={<SavedModels />} />
+                    <Route path="models/:id" element={<ModelDetail />} />
                     <Route path="research" element={<Research />} />
                     <Route path="reports" element={<Reports />} />
                     <Route path="reports/:id" element={<ReportView />} />

@@ -2,6 +2,23 @@
 // the SPA from "/" without clashing with API routes.
 const BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '') + '/api';
 
+const TOKEN_KEY = 'mlagent.accessToken';
+
+/** Access token for servers started with MLAGENT_ACCESS_TOKENS (kept only in this browser). */
+export function getAccessToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; }
+}
+export function setAccessToken(token) {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch { /* storage unavailable */ }
+}
+function authHeaders() {
+  const t = getAccessToken();
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
 export class ApiError extends Error {
   constructor(message, status, body) {
     super(message);
@@ -17,7 +34,7 @@ async function request(path, { method = 'GET', body, query, signal, raw = false 
       if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
     });
   }
-  const init = { method, signal, headers: {} };
+  const init = { method, signal, headers: { ...authHeaders() } };
   if (body instanceof FormData) init.body = body;
   else if (body !== undefined) {
     init.body = JSON.stringify(body);
@@ -30,8 +47,15 @@ async function request(path, { method = 'GET', body, query, signal, raw = false 
     if (err.name === 'AbortError') throw err;
     throw new ApiError('Cannot reach the ML-Agent server. Is the backend running on port 8000?', 0);
   }
+  if (res.status === 401) {
+    throw new ApiError('This server requires an access token. Add yours in Settings → Access.', 401);
+  }
   if (raw) {
-    if (!res.ok) throw new ApiError(`Request failed (${res.status})`, res.status);
+    if (!res.ok) {
+      let detail = `Request failed (${res.status})`;
+      try { detail = (await res.json()).detail || detail; } catch { /* not json */ }
+      throw new ApiError(detail, res.status);
+    }
     return res;
   }
   let data = null;
@@ -50,6 +74,7 @@ function upload(path, file, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', BASE + path);
+    Object.entries(authHeaders()).forEach(([k, v]) => xhr.setRequestHeader(k, v));
     xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
     xhr.onload = () => {
       let data = null;
@@ -67,6 +92,25 @@ function upload(path, file, onProgress) {
 export function wsUrl(path) {
   const origin = import.meta.env.VITE_API_URL || window.location.origin;
   return origin.replace(/^http/, 'ws').replace(/\/$/, '') + '/api' + path;
+}
+
+/** Authenticated file download: fetch → blob → save. Reports failures instead of
+ *  silently navigating to an error page. Returns {filename, bytes, sha256Header}. */
+export async function download(path, query, fallbackName = 'download') {
+  const res = await request(path, { query, raw: true });
+  const cd = res.headers.get('content-disposition') || '';
+  const match = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  const filename = match ? decodeURIComponent(match[1]) : fallbackName;
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  return { filename, bytes: blob.size, sha256: res.headers.get('x-content-sha256') };
 }
 
 export const fileUrl = (path, query) => {
@@ -110,6 +154,16 @@ export const api = {
   report: (id) => request(`/experiments/${id}/report`),
   narrative: (id) => request(`/experiments/${id}/report/narrative`, { method: 'POST' }),
   predict: (id, rows) => request(`/experiments/${id}/predict`, { method: 'POST', body: { rows } }),
+
+  whoami: () => request('/auth/whoami'),
+  saveModel: (expId, body) => request(`/experiments/${expId}/save-model`, { method: 'POST', body }),
+  experimentModels: (expId) => request(`/experiments/${expId}/saved-models`),
+  models: () => request('/models'),
+  model: (id) => request(`/models/${id}`),
+  updateModel: (id, body) => request(`/models/${id}`, { method: 'PATCH', body }),
+  deleteModel: (id) => request(`/models/${id}`, { method: 'DELETE' }),
+  verifyModel: (id) => request(`/models/${id}/verify`),
+  modelPredict: (id, rows) => request(`/models/${id}/predict`, { method: 'POST', body: { rows } }),
 
   searchPapers: (query) => request('/papers/search', { query }),
   summarizePaper: (body) => request('/papers/summarize', { method: 'POST', body }),

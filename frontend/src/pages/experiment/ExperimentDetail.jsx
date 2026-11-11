@@ -1,9 +1,10 @@
 import { AnimatePresence, motion } from 'framer-motion';
-import { Download, FileText, FlaskConical, GitCompare, Layers, Pencil, RotateCcw, Trash2 } from 'lucide-react';
+import { Download, FileText, FlaskConical, GitCompare, Layers, Package, Pencil, RotateCcw, Save, Trash2 } from 'lucide-react';
 import { useCallback, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Button, ConfirmDialog, Disclaimer, EmptyState, ErrorState, Field, Modal, PageHeader, Panel, SkeletonBlock, StatusBadge } from '../../components/ui';
-import { api, fileUrl } from '../../lib/api';
+import SaveModelModal from '../../components/SaveModelModal';
+import { api, download } from '../../lib/api';
 import { fmtDate, fmtDuration, fmtNum, METRICS } from '../../lib/format';
 import { useAsync } from '../../lib/hooks';
 import { useToast } from '../../lib/toast';
@@ -23,6 +24,9 @@ export default function ExperimentDetail() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [rename, setRename] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [saveOpen, setSaveOpen] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const saved = useAsync(() => api.experimentModels(id).then((d) => d.models), [id, completed], { enabled: !!completed });
 
   const onFinished = useCallback((evt) => {
     refreshExperiments();
@@ -35,9 +39,9 @@ export default function ExperimentDetail() {
   const remove = async () => {
     setBusy(true);
     try {
-      await api.deleteExperiment(id);
+      const res = await api.deleteExperiment(id);
       await refreshExperiments();
-      toast.success('Experiment deleted');
+      toast.success('Experiment deleted', res.saved_models_retained ? `${res.saved_models_retained} saved model(s) created from it were kept.` : undefined);
       navigate('/experiments');
     } catch (err) { toast.error('Delete failed', err.message); setBusy(false); }
   };
@@ -70,12 +74,27 @@ export default function ExperimentDetail() {
         actions={<>
           {completed && <Link className="btn" to={`/compare?ids=${id}`}><GitCompare size={14} />Compare</Link>}
           {completed && <Link className="btn" to={`/reports/${id}`}><FileText size={14} />Report</Link>}
-          {completed && <a className="btn" href={fileUrl(`/experiments/${id}/export-model`)} title="Download the fitted scikit-learn pipeline (joblib)"><Download size={14} />Model</a>}
+          {completed && <Button variant="primary" icon={Save} onClick={() => setSaveOpen(true)}>Save model</Button>}
+          {completed && (
+            <Button icon={Download} loading={downloading} title="Download this experiment's working artifact (joblib)"
+              onClick={async () => {
+                setDownloading(true);
+                try { await download(`/experiments/${id}/export-model`, undefined, 'model.joblib'); } catch (err) { toast.error('Download failed', err.message); } finally { setDownloading(false); }
+              }}>Artifact</Button>
+          )}
           {!isActiveStatus(e.status) && <Link className="btn" to={studioLink}><RotateCcw size={14} />Iterate</Link>}
           <Button iconOnly icon={Trash2} variant="ghost" aria-label="Delete experiment" title="Delete experiment" onClick={() => setConfirmDelete(true)} />
         </>}
       />
 
+      {saved.data?.length > 0 && (
+        <div className="callout" style={{ marginBottom: 16 }}>
+          <Package size={15} />
+          <div className="grow small">Saved as {saved.data.map((m, i) => (
+            <span key={m.id}>{i > 0 && ', '}<Link to={`/models/${m.id}`}><b>{m.name}</b> v{m.version}</Link></span>
+          ))}</div>
+        </div>
+      )}
       <AnimatePresence mode="wait">
         <motion.div key={isActiveStatus(e.status) ? 'monitor' : e.status} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: 0.22 }}>
           {isActiveStatus(e.status) && <TrainingMonitor experiment={e} onFinished={onFinished} />}
@@ -102,8 +121,10 @@ export default function ExperimentDetail() {
       <Disclaimer className="no-print" />
 
       <ConfirmDialog open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={remove} loading={busy} title="Delete experiment?">
-        This permanently removes the experiment record, its metrics and the saved model file.
+        This permanently removes the experiment record, its metrics, logs and working model file.
+        {saved.data?.length ? <> The {saved.data.length} model{saved.data.length > 1 ? 's' : ''} you saved from it in Saved Models {saved.data.length > 1 ? 'are' : 'is a'} separate cop{saved.data.length > 1 ? 'ies' : 'y'} and will be kept.</> : null}
       </ConfirmDialog>
+      {completed && <SaveModelModal open={saveOpen} onClose={() => setSaveOpen(false)} experiment={e} onSaved={() => saved.reload()} />}
       <Modal open={rename !== null} onClose={() => setRename(null)} title="Rename experiment"
         footer={<><Button onClick={() => setRename(null)}>Cancel</Button><Button variant="primary" loading={busy} disabled={!rename?.trim()} onClick={doRename}>Save</Button></>}>
         <Field label="Name" htmlFor="exp-name"><input id="exp-name" className="input" maxLength={120} value={rename || ''} onChange={(ev) => setRename(ev.target.value)} onKeyDown={(ev) => ev.key === 'Enter' && rename?.trim() && doRename()} /></Field>

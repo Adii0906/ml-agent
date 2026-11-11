@@ -20,7 +20,8 @@ Upload ─▶ Explore & clean ─▶ Choose target ─▶ Configure pipeline ─
 | **Datasets** | Drag-and-drop upload (CSV, TSV, Parquet) with progress and validation, library with rename/delete/download, sample datasets. Every file is pinned by SHA-256. |
 | **Data Explorer** | Overview (rows, columns, missing cells, duplicates, memory, inferred types). Spreadsheet-style table (server-side sort, search and pagination, missing-value highlighting). Per-column statistics, histograms, box plots and frequencies. Correlation heatmap, scatter explorer, missing-value pattern. Data-quality findings with severity. Target analysis (problem type, class balance, leakage suspects). |
 | **Model Studio** | Step-by-step experiment design: dataset → target → problem type → quality review → preprocessing (with a live pipeline diagram) → algorithms (rule-ranked, with strengths and limits) → hyperparameters (validated) → validation strategy → review and train. Several algorithms can be trained in one batch on the same split. |
-| **Experiments** | Full history, including failed and cancelled runs, with filtering and selection for comparison. Each experiment page shows a **live training monitor** (real stages and CV folds over WebSocket, cancellation) followed by **evaluation**: test/CV/train/baseline metrics, confusion matrix, per-class metrics, ROC, residual plots, error inspection, permutation importance, CV folds, learning curve, the configuration as executed, and a prediction playground. |
+| **Experiments** | Full history, including failed and cancelled runs, with filtering, selection for comparison, and deletion (trash icon, confirmation dialog, removes the record and working artifact; saved models are kept). Each experiment page shows a **live training monitor** (real stages and CV folds over WebSocket, cancellation) followed by **evaluation**: test/CV/train/baseline metrics, confusion matrix, per-class metrics, ROC, residual plots, error inspection, permutation importance, CV folds, learning curve, the configuration as executed, and a prediction playground. |
+| **Saved Models** | Save a completed experiment's fitted pipeline under a name and optional description. Each save gets a stable id and a version number per name. Browse the list, view metrics and input schema, run a test prediction, verify artifact integrity, and download as `.joblib` or `.pkl`, plus a `manifest.json` of metadata. Deployment is shown only as *Coming soon*. |
 | **Model Comparison** | Checks that runs share the same split and target, ranks by any metric, and states trade-offs (differences within CV noise, training cost, overfitting) rather than naming a single winner. |
 | **Research Papers** | arXiv search showing original titles, authors, dates, abstracts and links. Optional AI relevance notes and summaries are clearly labelled. |
 | **Insights & Reports** | A printable report for every completed experiment, built from recorded results with rule-based observations and limitations. Export as Markdown, text, or print to PDF. An optional AI narrative can be added and is clearly labelled. |
@@ -69,6 +70,57 @@ Every algorithm listed is trained and evaluated in the automated tests, for both
 
 ---
 
+## Saved models
+
+Saving copies the experiment's fitted pipeline into a separate, versioned model package:
+
+```
+<MLAGENT_DATA_DIR>/saved_models/<model_id>/
+  model.joblib    fitted Pipeline (preprocessing + estimator), label classes, embedded manifest
+  model.pkl       the same object, pickle protocol 5
+  manifest.json   metadata, also stored in SQLite (table saved_models)
+```
+
+The manifest records:
+- algorithm, estimator class and hyperparameters;
+- task and target;
+- an input schema (feature names, roles, training dtypes and column order) and an output schema;
+- the preprocessing configuration and pipeline stages;
+- metrics (test, CV, train, baseline);
+- dataset id and SHA-256;
+- split, random seed and CV settings;
+- the source experiment;
+- Python, scikit-learn, pandas, numpy and joblib versions;
+- each artifact's SHA-256 and size.
+
+**Loading outside ML-Agent.** An artifact needs only scikit-learn, pandas, numpy and the small `backend/mlagent_runtime` module, which holds the two custom pipeline components and the load and predict helpers:
+
+```python
+from mlagent_runtime import load_artifact, predict
+bundle = load_artifact("model.joblib", expected_sha256="<sha256 from the manifest>")
+predict(bundle, [{"age": 41, "plan": "pro"}])
+```
+
+**Designed for deployment later.** Deployment is not implemented yet. The storage is built so it won't need replacing when it is:
+- **Stable ids:** `mdl_…` ids are never reused, and each (owner, name) pair has its own version history.
+- **Separate storage:** artifacts live on disk; metadata lives in SQLite and `manifest.json`.
+- **Prediction already exists:** `POST /api/models/{id}/predict` loads the hash-verified artifact through the same `mlagent_runtime` code a serving container would use.
+
+**Integrity and safety:**
+- Every artifact is SHA-256-verified before it's downloaded or deserialised.
+- A missing or tampered artifact is refused (HTTP 410 or 409).
+- Only artifacts this server wrote are ever loaded. There is deliberately no endpoint for uploading pickles.
+- Saves and deletes are atomic:
+  - files are written to a temporary directory and moved into place;
+  - on delete, files are moved aside and restored if the database step fails;
+  - leftovers are swept on startup.
+
+**Deleting experiments.** Deleting an experiment removes its record and working artifact. Saved models are independent copies and are kept; they show their source as *(deleted)*. If an experiment is deleted while it's training, the run is cancelled, and any artifact it finishes writing afterwards is discarded.
+
+**Access control.** ML-Agent has no user accounts. For shared deployments, set `MLAGENT_ACCESS_TOKENS="alice:<token>,bob:<token>"`; tokens must be at least 16 characters. Every saved-model endpoint, plus experiment and dataset deletion and the experiment model export, then requires `Authorization: Bearer <token>`. Saved models belong to the token's owner, and other owners get 404. Users enter their token under **Settings → Access**; it's kept in the browser and sent as a header, never in URLs. Without tokens the server runs in single-user local mode, and `/api/system` reports which mode is active.
+
+---
+
 ## Run it
 
 ### Local development
@@ -111,6 +163,8 @@ Copy `.env.example` to `.env`. Every setting is optional:
 | `OLLAMA_URL`, `OLLAMA_MODEL`, `USE_OLLAMA` | Use a local Ollama model instead (also selectable in Settings). |
 | `MLAGENT_DATA_DIR` | Where datasets, models and the SQLite database are stored (default `backend/var`). |
 | `MLAGENT_MAX_UPLOAD_MB`, `MLAGENT_MAX_JOBS` | Upload limit and number of concurrent training jobs. |
+| `MLAGENT_MAX_MODEL_MB` | Largest model artifact that can be saved (default 1024). |
+| `MLAGENT_ACCESS_TOKENS` | `owner:token` pairs that turn on access control (see *Saved models*). |
 | `MLAGENT_CORS_ORIGINS`, `VITE_API_URL` | For deployments where the UI and API are on different origins. |
 
 Without an LLM, every core workflow still works: upload, explore, clean, train, evaluate, compare and report.
@@ -136,6 +190,9 @@ backend/   FastAPI · scikit-learn · pandas · SQLite
   core/training.py        validation, split, CV, fit, evaluation, importance, reproducibility
   core/jobs.py            thread-pool job manager, replayable events, cancellation, dedupe
   core/reports.py         rule-based observations, limitations, Markdown/text export
+  core/model_registry.py  saved models: versioning, integrity, atomic save/delete
+  core/auth.py            optional owner tokens
+  mlagent_runtime/        standalone loader/predictor + custom transformers used by artifacts
   core/llm.py             optional Groq/Ollama layer (explanations only, always labelled)
   core/papers.py          arXiv search
   tests/                  pytest suite
@@ -158,6 +215,13 @@ POST /api/experiments                    train one or more algorithms on one spl
 GET  /api/experiments[/{id}]             history / full results
 POST /api/experiments/{id}/cancel|predict
 GET  /api/experiments/{id}/report|export-report?format=md|txt|export-model
+DELETE /api/experiments/{id}             record + working artifact (saved models kept)
+POST /api/experiments/{id}/save-model    {name, description} → versioned saved model
+GET  /api/models[/{id}]                  saved models (owner-scoped), detail incl. manifest + versions
+PATCH|DELETE /api/models/{id}            rename / describe, delete record + files
+GET  /api/models/{id}/download?format=joblib|pkl   hash-verified artifact
+GET  /api/models/{id}/manifest|verify    metadata JSON / full integrity check
+POST /api/models/{id}/predict            predictions from the stored artifact
 WS   /api/ws/experiments/{id}            replayable training events
 GET  /api/papers/search                  arXiv (+ optional AI relevance notes)
 ```
@@ -172,7 +236,7 @@ The original endpoints still work: `/upload-dataset`, `/get-dataset-preview`, `/
 ## Testing
 
 ```bash
-.venv/bin/python -m pytest backend/tests -q        # 113 tests
+.venv/bin/python -m pytest backend/tests -q        # 131 tests
 cd frontend && npm run lint && npm run build
 ```
 
@@ -190,6 +254,15 @@ The backend suite covers:
   - invalid split or preprocessing options;
   - cancellation.
 - **Metrics:** checked against hand-computed values. Train and test scores are reported separately, and the baseline equals the majority share.
+- **Saved models:**
+  - the full save → restart → list → download (`.joblib` and `.pkl`) → load-and-predict cycle, run in an isolated interpreter that can import only `mlagent_runtime`, with predictions identical to the server's;
+  - manifest contents and versioning;
+  - deleting an experiment keeps its saved models; deleting a saved model removes its record and files;
+  - tampered and missing artifacts are refused, including a tampered experiment artifact at save time;
+  - simulated disk and database failures leave nothing behind or are rolled back;
+  - deleting an experiment mid-training leaves no orphaned artifact;
+  - path-traversal ids are rejected, and pickle uploads are refused;
+  - owner isolation and 401/404 behaviour, and weak tokens are rejected at startup.
 - **API and WebSocket:** upload validation and path traversal, the size limit, pagination, sorting and search, cleaning versions, the full experiment lifecycle and exports, failed-run visibility, request validation, duplicate rejection and cancellation, WebSocket replay for late subscribers, persistence across restarts and recovery of interrupted runs, settings validation, LLM-unavailable behaviour, and the legacy endpoints.
 
 ---
@@ -202,7 +275,12 @@ The backend suite covers:
 - Training progress is reported per stage and per fold. A single model fit has no percentage, so none is shown.
 - SVR does not rescale the target, so its error metrics are sensitive to the target's scale. This is noted in its reports.
 - The job queue lives in process memory. Restarting the server interrupts running jobs, which are then marked as failed.
-- There is no authentication. It is intended for local or trusted single-user deployments.
+- There are no user accounts. Access control is an optional set of owner tokens configured on the server. Only **saved models** are owner-scoped; datasets and experiments are shared by everyone who can reach the server, and only their deletion and model export require a token.
+- Saved models can't be uploaded or imported: loading a third-party pickle would let it run code. Deployment and hosted endpoints are not implemented yet.
+- Downloaded models need the same scikit-learn version recorded in the manifest, plus the `mlagent_runtime` module. Pickles are not portable across scikit-learn versions.
+- Browser downloads are buffered in memory before saving. For very large artifacts, use the API directly (for example `curl -H "Authorization: Bearer …" -OJ …/download`).
+- Infinite values are treated as missing and imputed. Numbers stored with currency or percent symbols (`$1,234`, `45%`) are still treated as categories.
+- Training time grows quickly for kernel and distance models, and with permutation importance on wide data. In testing, 200,000 rows took about 11 minutes across 7 algorithms, and 400 columns about 5 minutes.
 - arXiv search needs outbound network access to `export.arxiv.org`.
 
 AI-generated recommendations and explanations may contain errors. Verify your dataset, preprocessing decisions and evaluation methodology independently. Model performance depends on data quality, validation strategy and real-world conditions.

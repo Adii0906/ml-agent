@@ -196,3 +196,18 @@ def test_cancellation_between_stages():
 
     with pytest.raises(Cancelled):
         run_training(df, resolved, META, emit=lambda **e: None, is_cancelled=cancelled)
+
+
+def test_infinite_values_are_imputed_not_fatal():
+    from core import profiling
+    rng = np.random.default_rng(12)
+    df = pd.DataFrame({"a": rng.normal(size=200), "b": rng.normal(size=200)})
+    df["y"] = 2 * df.a + rng.normal(scale=0.1, size=200)
+    df.loc[[3, 50, 120], "a"] = np.inf
+    df.loc[[7], "b"] = -np.inf
+    for alg in ("linear_regression", "svr", "knn_regressor", "random_forest_regressor"):
+        out = run(df, target="y", algorithm_id=alg, options={"permutation_importance": False})
+        assert np.isfinite(out["results"]["metrics"]["test"]["rmse"])
+    pred = out["bundle"]["pipeline"].predict(pd.DataFrame({"a": [np.inf], "b": [0.0]}))
+    assert np.isfinite(pred).all()
+    assert "infinite:a" in {f["id"] for f in profiling.quality_findings(df)}

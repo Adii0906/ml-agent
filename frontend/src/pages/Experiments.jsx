@@ -1,10 +1,12 @@
 import { motion } from 'framer-motion';
-import { FlaskConical, GitCompare, Layers, Search } from 'lucide-react';
+import { FlaskConical, GitCompare, Layers, Search, Trash2 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import { Button, EmptyState, ErrorState, PageHeader, Panel, Prov, SkeletonBlock, StatusBadge } from '../components/ui';
+import { Button, ConfirmDialog, EmptyState, ErrorState, PageHeader, Panel, Prov, SkeletonBlock, StatusBadge } from '../components/ui';
+import { api } from '../lib/api';
+import { useToast } from '../lib/toast';
 import { fmtDuration, fmtNum, METRICS, primaryValue, timeAgo } from '../lib/format';
-import { useWorkspace } from '../lib/workspace';
+import { isActiveStatus, useWorkspace } from '../lib/workspace';
 
 export default function Experiments() {
   const { experiments, datasets, error, refreshExperiments } = useWorkspace();
@@ -12,6 +14,26 @@ export default function Experiments() {
   const navigate = useNavigate();
   const [q, setQ] = useState('');
   const [selected, setSelected] = useState([]);
+  const [toDelete, setToDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+  const toast = useToast();
+
+  const confirmDelete = async () => {
+    setDeleting(true);
+    try {
+      const res = await api.deleteExperiment(toDelete.id);
+      await refreshExperiments(); // re-read from the server rather than hiding the row locally
+      setSelected((s) => s.filter((x) => x !== toDelete.id));
+      toast.success('Experiment deleted', res.saved_models_retained
+        ? `${toDelete.name}. ${res.saved_models_retained} saved model${res.saved_models_retained > 1 ? 's' : ''} created from it ${res.saved_models_retained > 1 ? 'were' : 'was'} kept.`
+        : toDelete.name);
+      setToDelete(null);
+    } catch (e) {
+      toast.error('Experiment not deleted', e.message);
+    } finally {
+      setDeleting(false);
+    }
+  };
   const status = params.get('status') || '';
   const task = params.get('task') || '';
   const dataset = params.get('dataset') || '';
@@ -60,7 +82,7 @@ export default function Experiments() {
                 <tr>
                   <th style={{ width: 32 }}><span className="sr-only">Select</span></th>
                   <th>Experiment</th><th className="desktop-only">Dataset · target</th><th>Status</th>
-                  <th className="r">Test score <Prov kind="test" /></th><th className="r desktop-only">CV</th><th className="r desktop-only">Time</th><th className="desktop-only">Created</th>
+                  <th className="r">Test score <Prov kind="test" /></th><th className="r desktop-only">CV</th><th className="r desktop-only">Time</th><th className="desktop-only">Created</th><th style={{ width: 40 }}><span className="sr-only">Actions</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -82,6 +104,9 @@ export default function Experiments() {
                       <td className="r num small desktop-only">{e.metrics?.cv_mean !== undefined ? `${fmtNum(e.metrics.cv_mean, 3)} ± ${fmtNum(e.metrics.cv_std, 3)}` : '—'}</td>
                       <td className="r num small desktop-only">{e.training_time ? fmtDuration(e.training_time) : '—'}</td>
                       <td className="small subtle nowrap desktop-only">{timeAgo(e.created_at)}</td>
+                      <td className="r" onClick={(ev) => ev.stopPropagation()}>
+                        <Button variant="ghost" size="sm" iconOnly icon={Trash2} aria-label={`Delete ${e.name}`} title="Delete experiment" onClick={() => setToDelete(e)} />
+                      </td>
                     </motion.tr>
                   );
                 })}
@@ -90,6 +115,14 @@ export default function Experiments() {
           </div>
         )}
       </Panel>
+      <ConfirmDialog open={!!toDelete} onClose={() => !deleting && setToDelete(null)} onConfirm={confirmDelete} loading={deleting}
+        title="Delete experiment?" confirmLabel="Delete experiment">
+        <div className="stack-sm">
+          <p><strong style={{ color: 'var(--text)' }}>{toDelete?.name}</strong> will be permanently removed: its record, metrics, logs and working model file.</p>
+          {toDelete && isActiveStatus(toDelete.status) && <p>It is still training — the run will be cancelled.</p>}
+          <p className="small">Models you saved from it in Saved Models are separate copies and are <b>not</b> deleted.</p>
+        </div>
+      </ConfirmDialog>
     </div>
   );
 }

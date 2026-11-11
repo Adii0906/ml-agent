@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 import joblib
 import pandas as pd
-from fastapi import APIRouter, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -26,10 +26,12 @@ from starlette.concurrency import run_in_threadpool
 from core import algorithms as algs
 from core import papers as paper_search
 from core import profiling, recommend, reports
+from core.auth import Authenticator, Principal
 from core.config import BACKEND_DIR, ROOT_DIR, Settings
 from core.datasets import DatasetError, DatasetRegistry
 from core.jobs import ACTIVE, TERMINAL, DuplicateJob, JobManager, make_work
 from core.llm import DISCLAIMER, LLM, LLMUnavailable
+from core.model_registry import FORMATS, ModelRegistry, RegistryError
 from core.store import Store
 from core.training import TrainingError, fingerprint, validate_config
 from core.util import clean_json, safe_filename, utcnow
@@ -63,6 +65,16 @@ class CleanRequest(BaseModel):
 
 class RenameRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+
+
+class SaveModelRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=2000)
+
+
+class ModelUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=2000)
 
 
 class PredictRequest(BaseModel):
@@ -106,11 +118,16 @@ def create_app(settings: Optional[Settings] = None, static_dir: Optional[Path] =
     registry = DatasetRegistry(settings, store)
     manager = JobManager(store, settings.models_dir, settings.max_concurrent_jobs)
     llm = LLM(store)
+    models = ModelRegistry(settings, store)
+    auth = Authenticator(settings.access_tokens)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         manager.bind_loop(asyncio.get_running_loop())
         n = manager.recover_interrupted()
+        swept = models.sweep()
+        if swept:
+            log.info("Removed %d leftover temporary/trash artifacts", swept)
         if n:
             log.warning("Marked %d interrupted experiments as failed", n)
         yield
@@ -118,7 +135,16 @@ def create_app(settings: Optional[Settings] = None, static_dir: Optional[Path] =
 
     app = FastAPI(title="ML-Agent", version="2.0.0", lifespan=lifespan)
     app.state.settings, app.state.store, app.state.registry = settings, store, registry
-    app.state.manager, app.state.llm = manager, llm
+    app.state.manager, app.state.llm, app.state.models = manager, llm, models
+
+    def principal(request: Request) -> Principal:
+        """Resolve the caller. Protected endpoints depend on this; it raises 401 when tokens
+        are configured and the request does not carry a valid one."""
+        who = auth.resolve(request.headers.get("authorization"))
+        if who is None:
+            raise HTTPException(401, "Authentication required: send 'Authorization: Bearer <access token>'.",
+                                headers={"WWW-Authenticate": "Bearer"})
+        return who
 
     origins = [o.strip() for o in os.getenv("MLAGENT_CORS_ORIGINS", "*").split(",") if o.strip()]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=origins != ["*"],
@@ -188,6 +214,10 @@ def create_app(settings: Optional[Settings] = None, static_dir: Optional[Path] =
             "max_upload_mb": settings.max_upload_mb,
             "max_concurrent_jobs": settings.max_concurrent_jobs,
             "disclaimer": DISCLAIMER,
+            "auth": {"mode": "tokens" if auth.enabled else "local",
+                     "detail": "Access tokens required for model, download and delete endpoints." if auth.enabled
+                     else "Single-user local mode: no access tokens configured (MLAGENT_ACCESS_TOKENS)."},
+            "max_model_mb": settings.max_model_mb,
         }
 
     @api.get("/settings")
@@ -246,7 +276,7 @@ def create_app(settings: Optional[Settings] = None, static_dir: Optional[Path] =
         return await get_dataset(dataset_id)
 
     @api.delete("/datasets/{dataset_id}")
-    async def delete_dataset(dataset_id: str):
+    async def delete_dataset(dataset_id: str, who: Principal = Depends(principal)):
         dataset_or_404(dataset_id)
         running = [e for e in store.list_experiments() if e.get("dataset_id") == dataset_id and e["status"] in ACTIVE]
         if running:
@@ -472,14 +502,42 @@ def create_app(settings: Optional[Settings] = None, static_dir: Optional[Path] =
             raise HTTPException(409, "Experiment is not running in this server process.")
         return {"status": "cancelling"}
 
+    @api.get("/auth/whoami")
+    async def whoami(who: Principal = Depends(principal)):
+        return {"owner": who.owner, "authenticated": who.authenticated, "mode": "tokens" if auth.enabled else "local"}
+
     @api.delete("/experiments/{exp_id}")
-    async def delete_experiment(exp_id: str):
+    async def delete_experiment(exp_id: str, who: Principal = Depends(principal)):
+        """Delete the experiment record and its working model file.
+
+        Saved models are independent copies (see core/model_registry.py) and are kept.
+        The artifact is moved aside before the record is deleted so a database failure can
+        be rolled back; a job still running for this experiment is cancelled, and the job
+        manager removes any artifact it finishes writing afterwards."""
         exp = experiment_or_404(exp_id)
         if exp["status"] in ACTIVE:
             manager.cancel(exp_id)
-        store.delete_experiment(exp_id)
-        (settings.models_dir / f"{exp_id}.joblib").unlink(missing_ok=True)
-        return {"status": "success", "message": "Experiment deleted"}
+        artifact = settings.models_dir / f"{exp_id}.joblib"
+        trash = settings.models_dir / f".trash-{exp_id}"
+        moved = False
+        if artifact.exists():
+            try:
+                os.replace(artifact, trash)
+                moved = True
+            except OSError as exc:
+                raise HTTPException(500, f"Could not remove the experiment's model file: {exc}") from None
+        try:
+            if not store.delete_experiment(exp_id):
+                raise RuntimeError("record not found during delete")
+        except Exception as exc:
+            if moved:
+                os.replace(trash, artifact)
+            raise HTTPException(500, f"Could not delete the experiment record: {exc}") from None
+        if moved:
+            trash.unlink(missing_ok=True)
+        kept = store.models_for_experiment(exp_id)
+        return {"status": "success", "message": "Experiment deleted", "deleted_id": exp_id,
+                "saved_models_retained": len(kept)}
 
     def completed(exp_id: str) -> Dict[str, Any]:
         exp = experiment_or_404(exp_id)
@@ -527,7 +585,7 @@ def create_app(settings: Optional[Settings] = None, static_dir: Optional[Path] =
                                  headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
     @api.get("/experiments/{exp_id}/export-model")
-    async def export_model(exp_id: str):
+    async def export_model(exp_id: str, who: Principal = Depends(principal)):
         exp = completed(exp_id)
         path = settings.models_dir / f"{exp_id}.joblib"
         if not path.exists():
@@ -568,6 +626,101 @@ def create_app(settings: Optional[Settings] = None, static_dir: Optional[Path] =
                 out["predictions"].append(item)
             return clean_json(out)
         return await run_in_threadpool(work)
+
+    # -------------------------------------------------------------- saved models
+    def registry_error(exc: RegistryError) -> HTTPException:
+        return HTTPException(exc.status, str(exc))
+
+    def owned_model(model_id: str, who: Principal) -> Dict[str, Any]:
+        # Models of other owners are reported as not found, so their existence is not leaked.
+        m = models.get_owned(model_id, who.owner)
+        if not m:
+            raise HTTPException(404, "Saved model not found.")
+        return m
+
+    @api.post("/experiments/{exp_id}/save-model", status_code=201)
+    async def save_model(exp_id: str, body: SaveModelRequest, who: Principal = Depends(principal)):
+        exp = experiment_or_404(exp_id)
+        try:
+            saved = await run_in_threadpool(models.save_from_experiment, exp, who.owner, body.name, body.description)
+        except RegistryError as exc:
+            raise registry_error(exc) from None
+        return models.public(saved)
+
+    @api.get("/experiments/{exp_id}/saved-models")
+    async def experiment_saved_models(exp_id: str, who: Principal = Depends(principal)):
+        return {"models": [models.public(m) for m in store.models_for_experiment(exp_id) if m["owner"] == who.owner]}
+
+    @api.get("/models")
+    async def list_models(lineage: Optional[str] = None, who: Principal = Depends(principal)):
+        items = [m for m in store.list_saved_models(owner=who.owner) if not lineage or m["lineage"] == lineage]
+        return {"models": [models.public(m) for m in items], "owner": who.owner}
+
+    @api.get("/models/{model_id}")
+    async def get_model(model_id: str, who: Principal = Depends(principal)):
+        m = owned_model(model_id, who)
+        versions = [{"id": v["id"], "version": v["version"], "created_at": v["created_at"]}
+                    for v in store.list_saved_models(owner=who.owner) if v["lineage"] == m["lineage"]]
+        return {**models.public(m, include_manifest=True), "versions": sorted(versions, key=lambda v: v["version"])}
+
+    @api.patch("/models/{model_id}")
+    async def update_model(model_id: str, body: ModelUpdate, who: Principal = Depends(principal)):
+        owned_model(model_id, who)
+        fields = {k: (v.strip() if isinstance(v, str) else v) for k, v in body.model_dump(exclude_unset=True).items()}
+        if "name" in fields and not fields["name"]:
+            raise HTTPException(400, "A model name is required.")
+        if fields:
+            store.update_saved_model(model_id, **fields)
+        return models.public(store.get_saved_model(model_id))
+
+    @api.delete("/models/{model_id}")
+    async def delete_model(model_id: str, who: Principal = Depends(principal)):
+        m = owned_model(model_id, who)
+        try:
+            await run_in_threadpool(models.delete, m)
+        except RegistryError as exc:
+            raise registry_error(exc) from None
+        return {"status": "success", "deleted_id": model_id}
+
+    @api.get("/models/{model_id}/verify")
+    async def verify_model(model_id: str, who: Principal = Depends(principal)):
+        m = owned_model(model_id, who)
+        out = {}
+        for fmt in FORMATS:
+            try:
+                await run_in_threadpool(models.verify, m, fmt)
+                out[fmt] = "ok"
+            except RegistryError as exc:
+                out[fmt] = str(exc)
+        return {"id": model_id, "artifacts": out, "valid": all(v == "ok" for v in out.values())}
+
+    @api.get("/models/{model_id}/download")
+    async def download_model(model_id: str, format: Literal["joblib", "pkl"] = "joblib", who: Principal = Depends(principal)):
+        m = owned_model(model_id, who)
+        try:
+            path = await run_in_threadpool(models.verify, m, format)
+        except RegistryError as exc:
+            raise registry_error(exc) from None
+        fname = f"{safe_filename(m['lineage'], 'model')}-v{m['version']}.{format}"
+        return FileResponse(path, media_type="application/octet-stream", filename=fname,
+                            headers={"X-Content-SHA256": m["artifacts"][format]["sha256"], "Cache-Control": "no-store"})
+
+    @api.get("/models/{model_id}/manifest")
+    async def model_manifest(model_id: str, who: Principal = Depends(principal)):
+        m = owned_model(model_id, who)
+        fname = f"{safe_filename(m['lineage'], 'model')}-v{m['version']}.manifest.json"
+        return JSONResponse(clean_json(m["manifest"]), headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+    @api.post("/models/{model_id}/predict")
+    async def model_predict(model_id: str, body: PredictRequest, who: Principal = Depends(principal)):
+        m = owned_model(model_id, who)
+        try:
+            preds = await run_in_threadpool(models.predict, m, body.rows)
+        except RegistryError as exc:
+            raise registry_error(exc) from None
+        except KeyError as exc:
+            raise HTTPException(400, str(exc).strip("'\"")) from None
+        return {"model_id": model_id, "version": m["version"], "task": m["task"], "predictions": clean_json(preds)}
 
     # -------------------------------------------------------------- research
     @api.get("/papers/search")
@@ -767,7 +920,8 @@ def create_app(settings: Optional[Settings] = None, static_dir: Optional[Path] =
         detail = exc.detail
         payload = detail if isinstance(detail, dict) else {"message": str(detail)}
         payload.setdefault("message", "Request failed")
-        return JSONResponse({"detail": payload["message"], **payload}, status_code=exc.status_code)
+        return JSONResponse({"detail": payload["message"], **payload}, status_code=exc.status_code,
+                            headers=getattr(exc, "headers", None))
 
     return app
 

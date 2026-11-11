@@ -1,7 +1,7 @@
-import { Cpu, Monitor, Moon, Palette, Plug, Server, Sun } from 'lucide-react';
+import { Cpu, KeyRound, Monitor, Moon, Palette, Plug, Server, Sun } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Badge, Button, Callout, ErrorState, Field, PageHeader, Panel, Segmented, SkeletonBlock } from '../components/ui';
-import { api } from '../lib/api';
+import { api, getAccessToken, setAccessToken } from '../lib/api';
 import { useAsync } from '../lib/hooks';
 import { useTheme } from '../lib/theme';
 import { useToast } from '../lib/toast';
@@ -14,6 +14,13 @@ export default function Settings() {
   const [form, setForm] = useState(null);
   const [saving, setSaving] = useState(false);
   const [probe, setProbe] = useState(null);
+  const [token, setToken] = useState(getAccessToken);
+  const [whoami, setWhoami] = useState(null);
+  const saveToken = async () => {
+    setAccessToken(token.trim());
+    setWhoami({ loading: true });
+    try { setWhoami({ data: await api.whoami() }); } catch (e) { setWhoami({ error: e.message }); }
+  };
   const toast = useToast();
   useEffect(() => { if (settings.data && !form) setForm(settings.data.llm); }, [settings.data, form]);
 
@@ -43,6 +50,22 @@ export default function Settings() {
             <Segmented ariaLabel="Theme" value={preference} onChange={setPreference} options={[
               { value: 'light', label: 'Light', icon: Sun }, { value: 'dark', label: 'Dark', icon: Moon }, { value: 'system', label: 'System', icon: Monitor }]} />
           </Field>
+        </Panel>
+
+        <Panel title="Access" icon={KeyRound} actions={system?.auth && <Badge tone={system.auth.mode === 'tokens' ? 'info' : undefined}>{system.auth.mode === 'tokens' ? 'Tokens required' : 'Local mode'}</Badge>}
+          footer="The token is kept only in this browser and sent as an Authorization header to protected endpoints (saved models, downloads, deletions).">
+          <div className="stack">
+            <p className="small muted">{system?.auth?.detail || 'Checking server…'}</p>
+            <div className="row wrap" style={{ gap: 8, alignItems: 'flex-end' }}>
+              <div style={{ width: 'min(360px, 100%)' }}>
+                <Field label="Access token" htmlFor="tok"><input id="tok" className="input mono" type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} placeholder={system?.auth?.mode === 'tokens' ? 'Paste your token' : 'Not required in local mode'} /></Field>
+              </div>
+              <Button onClick={saveToken} loading={whoami?.loading}>Save & check</Button>
+              {token && <Button variant="ghost" onClick={() => { setToken(''); setAccessToken(''); setWhoami(null); }}>Clear</Button>}
+            </div>
+            {whoami?.data && <Callout tone="good">Signed in as <b>{whoami.data.owner}</b> ({whoami.data.mode} mode).</Callout>}
+            {whoami?.error && <Callout tone="bad">{whoami.error}</Callout>}
+          </div>
         </Panel>
 
         <Panel title="AI provider" icon={Plug} actions={status && <Badge tone={status.available ? 'good' : undefined}>{status.available ? `Active: ${status.active_provider}` : 'Disabled'}</Badge>}

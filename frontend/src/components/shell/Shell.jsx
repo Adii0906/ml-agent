@@ -1,10 +1,10 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import {
-  BookOpen, Command, Database, FileText, FlaskConical, GitCompare, Layers, LayoutDashboard, Menu, Monitor, Moon,
+  BookOpen, Command, Database, Package, FileText, FlaskConical, GitCompare, Layers, LayoutDashboard, Menu, Monitor, Moon,
   PanelLeftClose, PanelLeftOpen, Search, Settings, Sun, Table2,
 } from 'lucide-react';
 import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { Link, NavLink, useLocation, useNavigate, useOutlet } from 'react-router-dom';
 import { useLocalStorage } from '../../lib/hooks';
 import { useTheme } from '../../lib/theme';
 import { useWorkspace } from '../../lib/workspace';
@@ -36,6 +36,7 @@ const NAV = [
     { to: '/studio', label: 'Model Studio', icon: FlaskConical },
     { to: '/experiments', label: 'Experiments', icon: Layers, count: 'experiments' },
     { to: '/compare', label: 'Model Comparison', icon: GitCompare },
+    { to: '/models', label: 'Saved Models', icon: Package },
   ] },
   { group: 'Intelligence', items: [
     { to: '/research', label: 'Research Papers', icon: BookOpen },
@@ -100,13 +101,14 @@ function useCrumbs() {
   return useMemo(() => {
     const parts = pathname.split('/').filter(Boolean);
     const out = [{ label: 'ML-Agent', to: '/' }];
-    const names = { datasets: 'Datasets', explorer: 'Data Explorer', studio: 'Model Studio', experiments: 'Experiments', compare: 'Model Comparison', research: 'Research Papers', reports: 'Insights & Reports', settings: 'Settings' };
+    const names = { datasets: 'Datasets', explorer: 'Data Explorer', studio: 'Model Studio', experiments: 'Experiments', compare: 'Model Comparison', models: 'Saved Models', research: 'Research Papers', reports: 'Insights & Reports', settings: 'Settings' };
     if (!parts.length) return [...out, { label: 'Overview' }];
     out.push({ label: names[parts[0]] || parts[0], to: `/${parts[0]}` });
     if (parts[1]) {
       let label = parts[1];
       if (parts[0] === 'datasets') label = datasets?.find((d) => d.id === parts[1])?.name || 'Dataset';
       if (parts[0] === 'experiments' || parts[0] === 'reports') label = experiments?.find((e) => e.id === parts[1])?.name || 'Experiment';
+      if (parts[0] === 'models') label = 'Model';
       out.push({ label });
     }
     return out;
@@ -223,6 +225,10 @@ export function AppShell() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
   const section = location.pathname.split('/').slice(0, 3).join('/');
+  // Capture the routed element for this render. The exiting page keeps its own element during the
+  // transition; a live <Outlet/> would render the NEW page inside the exiting wrapper, mounting it twice
+  // (double fetches, and anything typed in the first ~200 ms was lost).
+  const outlet = useOutlet();
   return (
     <div className={`shell ${collapsed ? 'collapsed' : ''}`}>
       <a href="#main" className="sr-only">Skip to content</a>
@@ -235,7 +241,7 @@ export function AppShell() {
             <motion.div key={section} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
               transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}>
               <Suspense fallback={<div className="page"><div style={{ maxWidth: 520 }}><SkeletonBlock rows={5} /></div></div>}>
-                <Outlet />
+                {outlet}
               </Suspense>
             </motion.div>
           </AnimatePresence>

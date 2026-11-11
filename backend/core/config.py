@@ -28,14 +28,17 @@ class Settings:
         base = Path(data_dir or os.getenv("MLAGENT_DATA_DIR") or (BACKEND_DIR / "var"))
         self.data_dir = base.resolve()
         self.datasets_dir = self.data_dir / "datasets"
-        self.models_dir = self.data_dir / "models"
+        self.models_dir = self.data_dir / "models"            # per-experiment artifacts (working copies)
+        self.saved_models_dir = self.data_dir / "saved_models"  # user-saved, versioned model packages
         self.reports_dir = self.data_dir / "reports"
         self.db_path = self.data_dir / "ml_agent.db"
         # Legacy upload directory (old /upload-dataset API wrote here).
         self.legacy_upload_dir = BACKEND_DIR / "uploads"
         self.max_upload_mb = _int_env("MLAGENT_MAX_UPLOAD_MB", 200)
         self.max_concurrent_jobs = max(1, _int_env("MLAGENT_MAX_JOBS", 2))
-        for d in (self.data_dir, self.datasets_dir, self.models_dir, self.reports_dir):
+        self.max_model_mb = _int_env("MLAGENT_MAX_MODEL_MB", 1024)
+        self.access_tokens = os.getenv("MLAGENT_ACCESS_TOKENS", "")
+        for d in (self.data_dir, self.datasets_dir, self.models_dir, self.saved_models_dir, self.reports_dir):
             d.mkdir(parents=True, exist_ok=True)
 
 
